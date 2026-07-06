@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from db_compat import get_table_columns
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -72,9 +73,10 @@ def create_all_tables(conn):
 
     # 1. SandboxOrders table
     conn.execute(
-        text("""
+        text(
+            """
         CREATE TABLE IF NOT EXISTS sandbox_orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             orderid VARCHAR(50) UNIQUE NOT NULL,
             user_id VARCHAR(50) NOT NULL,
             strategy VARCHAR(100),
@@ -95,14 +97,16 @@ def create_all_tables(conn):
             order_timestamp DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             update_timestamp DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )
-    """)
+    """
+        )
     )
 
     # 2. SandboxTrades table
     conn.execute(
-        text("""
+        text(
+            """
         CREATE TABLE IF NOT EXISTS sandbox_trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             tradeid VARCHAR(50) UNIQUE NOT NULL,
             orderid VARCHAR(50) NOT NULL,
             user_id VARCHAR(50) NOT NULL,
@@ -115,14 +119,16 @@ def create_all_tables(conn):
             strategy VARCHAR(100),
             trade_timestamp DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )
-    """)
+    """
+        )
     )
 
     # 3. SandboxPositions table
     conn.execute(
-        text("""
+        text(
+            """
         CREATE TABLE IF NOT EXISTS sandbox_positions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             user_id VARCHAR(50) NOT NULL,
             symbol VARCHAR(50) NOT NULL,
             exchange VARCHAR(20) NOT NULL,
@@ -138,14 +144,16 @@ def create_all_tables(conn):
             updated_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             UNIQUE(user_id, symbol, exchange, product)
         )
-    """)
+    """
+        )
     )
 
     # 4. SandboxHoldings table
     conn.execute(
-        text("""
+        text(
+            """
         CREATE TABLE IF NOT EXISTS sandbox_holdings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             user_id VARCHAR(50) NOT NULL,
             symbol VARCHAR(50) NOT NULL,
             exchange VARCHAR(20) NOT NULL,
@@ -159,14 +167,16 @@ def create_all_tables(conn):
             updated_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             UNIQUE(user_id, symbol, exchange)
         )
-    """)
+    """
+        )
     )
 
     # 5. SandboxFunds table
     conn.execute(
-        text("""
+        text(
+            """
         CREATE TABLE IF NOT EXISTS sandbox_funds (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             user_id VARCHAR(50) UNIQUE NOT NULL,
             total_capital DECIMAL(15, 2) DEFAULT 10000000.00,
             available_balance DECIMAL(15, 2) DEFAULT 10000000.00,
@@ -179,20 +189,23 @@ def create_all_tables(conn):
             created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )
-    """)
+    """
+        )
     )
 
     # 6. SandboxConfig table
     conn.execute(
-        text("""
+        text(
+            """
         CREATE TABLE IF NOT EXISTS sandbox_config (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             config_key VARCHAR(100) UNIQUE NOT NULL,
             config_value TEXT NOT NULL,
             description TEXT,
             updated_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )
-    """)
+    """
+        )
     )
 
     conn.commit()
@@ -205,45 +218,81 @@ def create_all_indexes(conn):
     logger.info("Creating indexes...")
 
     # Indexes for sandbox_orders
-    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_orderid ON sandbox_orders(orderid)"))
-    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_user_id ON sandbox_orders(user_id)"))
-    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_symbol ON sandbox_orders(symbol)"))
-    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_exchange ON sandbox_orders(exchange)"))
     conn.execute(
-        text("CREATE INDEX IF NOT EXISTS idx_order_status ON sandbox_orders(order_status)")
+        text("CREATE INDEX IF NOT EXISTS idx_orderid ON sandbox_orders(orderid)")
     )
     conn.execute(
-        text("CREATE INDEX IF NOT EXISTS idx_user_status ON sandbox_orders(user_id, order_status)")
+        text("CREATE INDEX IF NOT EXISTS idx_user_id ON sandbox_orders(user_id)")
     )
     conn.execute(
-        text("CREATE INDEX IF NOT EXISTS idx_symbol_exchange ON sandbox_orders(symbol, exchange)")
+        text("CREATE INDEX IF NOT EXISTS idx_symbol ON sandbox_orders(symbol)")
+    )
+    conn.execute(
+        text("CREATE INDEX IF NOT EXISTS idx_exchange ON sandbox_orders(exchange)")
+    )
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_order_status ON sandbox_orders(order_status)"
+        )
+    )
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_user_status ON sandbox_orders(user_id, order_status)"
+        )
+    )
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_symbol_exchange ON sandbox_orders(symbol, exchange)"
+        )
     )
 
     # Indexes for sandbox_trades
-    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tradeid ON sandbox_trades(tradeid)"))
-    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trade_orderid ON sandbox_trades(orderid)"))
-    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trade_user ON sandbox_trades(user_id)"))
     conn.execute(
-        text("CREATE INDEX IF NOT EXISTS idx_user_symbol_trade ON sandbox_trades(user_id, symbol)")
+        text("CREATE INDEX IF NOT EXISTS idx_tradeid ON sandbox_trades(tradeid)")
+    )
+    conn.execute(
+        text("CREATE INDEX IF NOT EXISTS idx_trade_orderid ON sandbox_trades(orderid)")
+    )
+    conn.execute(
+        text("CREATE INDEX IF NOT EXISTS idx_trade_user ON sandbox_trades(user_id)")
+    )
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_user_symbol_trade ON sandbox_trades(user_id, symbol)"
+        )
     )
 
     # Indexes for sandbox_positions
-    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_position_user ON sandbox_positions(user_id)"))
     conn.execute(
-        text("CREATE INDEX IF NOT EXISTS idx_user_symbol ON sandbox_positions(user_id, symbol)")
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_position_user ON sandbox_positions(user_id)"
+        )
     )
     conn.execute(
-        text("CREATE INDEX IF NOT EXISTS idx_user_product ON sandbox_positions(user_id, product)")
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_user_symbol ON sandbox_positions(user_id, symbol)"
+        )
+    )
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_user_product ON sandbox_positions(user_id, product)"
+        )
     )
 
     # Indexes for sandbox_holdings
-    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_holding_user ON sandbox_holdings(user_id)"))
+    conn.execute(
+        text("CREATE INDEX IF NOT EXISTS idx_holding_user ON sandbox_holdings(user_id)")
+    )
 
     # Index for sandbox_funds
-    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_funds_user ON sandbox_funds(user_id)"))
+    conn.execute(
+        text("CREATE INDEX IF NOT EXISTS idx_funds_user ON sandbox_funds(user_id)")
+    )
 
     # Index for sandbox_config
-    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_config_key ON sandbox_config(config_key)"))
+    conn.execute(
+        text("CREATE INDEX IF NOT EXISTS idx_config_key ON sandbox_config(config_key)")
+    )
 
     conn.commit()
     logger.info("✅ All indexes created successfully")
@@ -255,38 +304,42 @@ def add_missing_columns(conn):
     logger.info("Checking for missing columns...")
 
     # Check and add margin_blocked to sandbox_orders if missing
-    result = conn.execute(text("PRAGMA table_info(sandbox_orders)"))
-    columns = [row[1] for row in result]
+    columns = get_table_columns(conn, "sandbox_orders")
 
     if "margin_blocked" not in columns:
         conn.execute(
-            text("""
+            text(
+                """
             ALTER TABLE sandbox_orders
             ADD COLUMN margin_blocked DECIMAL(10,2) DEFAULT 0.00
-        """)
+        """
+            )
         )
         logger.info("✅ Added margin_blocked column to sandbox_orders")
 
     # Check and add accumulated_realized_pnl to sandbox_positions if missing
-    result = conn.execute(text("PRAGMA table_info(sandbox_positions)"))
-    columns = [row[1] for row in result]
+    columns = get_table_columns(conn, "sandbox_positions")
 
     if "accumulated_realized_pnl" not in columns:
         conn.execute(
-            text("""
+            text(
+                """
             ALTER TABLE sandbox_positions
             ADD COLUMN accumulated_realized_pnl DECIMAL(10,2) DEFAULT 0.00
-        """)
+        """
+            )
         )
         logger.info("✅ Added accumulated_realized_pnl column to sandbox_positions")
 
     # Check and add margin_blocked to sandbox_positions if missing
     if "margin_blocked" not in columns:
         conn.execute(
-            text("""
+            text(
+                """
             ALTER TABLE sandbox_positions
             ADD COLUMN margin_blocked DECIMAL(15,2) DEFAULT 0.00
-        """)
+        """
+            )
         )
         logger.info("✅ Added margin_blocked column to sandbox_positions")
 
@@ -304,7 +357,11 @@ def insert_default_config(conn):
             "10000000.00",
             "Starting sandbox capital in INR (₹1 Crore) - Min: ₹1000",
         ),
-        ("reset_day", "Never", "Day of week for automatic fund reset (Never = disabled)"),
+        (
+            "reset_day",
+            "Never",
+            "Day of week for automatic fund reset (Never = disabled)",
+        ),
         ("reset_time", "00:00", "Time for automatic fund reset (IST)"),
         (
             "order_check_interval",
@@ -316,12 +373,32 @@ def insert_default_config(conn):
             "5",
             "Interval in seconds to update MTM - Range: 0-60 seconds (0 = manual only)",
         ),
-        ("nse_bse_square_off_time", "15:15", "Square-off time for NSE/BSE MIS positions (IST)"),
-        ("cds_bcd_square_off_time", "16:45", "Square-off time for CDS/BCD MIS positions (IST)"),
+        (
+            "nse_bse_square_off_time",
+            "15:15",
+            "Square-off time for NSE/BSE MIS positions (IST)",
+        ),
+        (
+            "cds_bcd_square_off_time",
+            "16:45",
+            "Square-off time for CDS/BCD MIS positions (IST)",
+        ),
         ("mcx_square_off_time", "23:30", "Square-off time for MCX MIS positions (IST)"),
-        ("ncdex_square_off_time", "17:00", "Square-off time for NCDEX MIS positions (IST)"),
-        ("equity_mis_leverage", "5", "Leverage multiplier for equity MIS (NSE/BSE) - Range: 1-50x"),
-        ("equity_cnc_leverage", "1", "Leverage multiplier for equity CNC (NSE/BSE) - Range: 1-50x"),
+        (
+            "ncdex_square_off_time",
+            "17:00",
+            "Square-off time for NCDEX MIS positions (IST)",
+        ),
+        (
+            "equity_mis_leverage",
+            "5",
+            "Leverage multiplier for equity MIS (NSE/BSE) - Range: 1-50x",
+        ),
+        (
+            "equity_cnc_leverage",
+            "1",
+            "Leverage multiplier for equity CNC (NSE/BSE) - Range: 1-50x",
+        ),
         (
             "futures_leverage",
             "10",
@@ -337,9 +414,21 @@ def insert_default_config(conn):
             "1",
             "Leverage multiplier for selling options (same as buying - full premium) - Range: 1-50x",
         ),
-        ("order_rate_limit", "10", "Maximum orders per second - Range: 1-100 orders/sec"),
-        ("api_rate_limit", "50", "Maximum API calls per second - Range: 1-1000 calls/sec"),
-        ("smart_order_rate_limit", "2", "Maximum smart orders per second - Range: 1-50 orders/sec"),
+        (
+            "order_rate_limit",
+            "10",
+            "Maximum orders per second - Range: 1-100 orders/sec",
+        ),
+        (
+            "api_rate_limit",
+            "50",
+            "Maximum API calls per second - Range: 1-1000 calls/sec",
+        ),
+        (
+            "smart_order_rate_limit",
+            "2",
+            "Maximum smart orders per second - Range: 1-50 orders/sec",
+        ),
         (
             "smart_order_delay",
             "0.5",
@@ -355,10 +444,12 @@ def insert_default_config(conn):
         )
         if not result.fetchone():
             conn.execute(
-                text("""
+                text(
+                    """
                 INSERT INTO sandbox_config (config_key, config_value, description)
                 VALUES (:key, :value, :description)
-            """),
+            """
+                ),
                 {"key": key, "value": value, "description": description},
             )
             added_count += 1
@@ -419,10 +510,12 @@ def status():
             missing_tables = []
             for table in required_tables:
                 result = conn.execute(
-                    text(f"""
+                    text(
+                        f"""
                     SELECT name FROM sqlite_master
                     WHERE type='table' AND name='{table}'
-                """)
+                """
+                    )
                 )
                 if not result.fetchone():
                     missing_tables.append(table)
@@ -446,7 +539,9 @@ def status():
             columns = [row[1] for row in result]
 
             if "accumulated_realized_pnl" not in columns:
-                logger.info("⚠️  Missing accumulated_realized_pnl column in sandbox_positions")
+                logger.info(
+                    "⚠️  Missing accumulated_realized_pnl column in sandbox_positions"
+                )
                 logger.info("   Migration needed")
                 return False
 
@@ -457,14 +552,16 @@ def status():
 
             # Show statistics
             result = conn.execute(
-                text("""
+                text(
+                    """
                 SELECT
                     (SELECT COUNT(*) FROM sandbox_orders) as total_orders,
                     (SELECT COUNT(*) FROM sandbox_trades) as total_trades,
                     (SELECT COUNT(*) FROM sandbox_positions WHERE quantity != 0) as open_positions,
                     (SELECT COUNT(DISTINCT user_id) FROM sandbox_funds) as total_users,
                     (SELECT COUNT(*) FROM sandbox_config) as config_entries
-            """)
+            """
+                )
             )
 
             stats = result.fetchone()

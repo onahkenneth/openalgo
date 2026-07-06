@@ -1,8 +1,6 @@
 import json
 import os
 
-import httpx
-
 from utils.httpx_client import get_httpx_client
 
 

@@ -17,7 +17,9 @@ LATENCY_DATABASE_URL = os.getenv("LATENCY_DATABASE_URL", "sqlite:///db/latency.d
 if LATENCY_DATABASE_URL and "sqlite" in LATENCY_DATABASE_URL:
     # SQLite: Use NullPool to prevent connection pool exhaustion
     latency_engine = create_engine(
-        LATENCY_DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
+        LATENCY_DATABASE_URL,
+        poolclass=NullPool,
+        connect_args={"check_same_thread": False},
     )
 else:
     # For other databases like PostgreSQL, use connection pooling
@@ -105,7 +107,11 @@ class OrderLatency(LatencyBase):
     def get_recent_logs(limit=100):
         """Get recent latency logs ordered by timestamp"""
         try:
-            return OrderLatency.query.order_by(OrderLatency.timestamp.desc()).limit(limit).all()
+            return (
+                OrderLatency.query.order_by(OrderLatency.timestamp.desc())
+                .limit(limit)
+                .all()
+            )
         except Exception as e:
             logger.exception(f"Error getting recent latency logs: {str(e)}")
             return []
@@ -121,7 +127,9 @@ class OrderLatency(LatencyBase):
             # This replaces 9 separate queries with 1
             overall_stats = latency_session.query(
                 func.count(OrderLatency.id).label("total"),
-                func.sum(case((OrderLatency.status == "FAILED", 1), else_=0)).label("failed"),
+                func.sum(case((OrderLatency.status == "FAILED", 1), else_=0)).label(
+                    "failed"
+                ),
                 func.avg(OrderLatency.rtt_ms).label("avg_rtt"),
                 func.avg(OrderLatency.overhead_ms).label("avg_overhead"),
                 func.avg(OrderLatency.total_latency_ms).label("avg_total"),
@@ -173,13 +181,15 @@ class OrderLatency(LatencyBase):
                 latency_session.query(
                     OrderLatency.broker,
                     func.count(OrderLatency.id).label("total"),
-                    func.sum(case((OrderLatency.status == "FAILED", 1), else_=0)).label("failed"),
+                    func.sum(case((OrderLatency.status == "FAILED", 1), else_=0)).label(
+                        "failed"
+                    ),
                     func.avg(OrderLatency.rtt_ms).label("avg_rtt"),
                     func.avg(OrderLatency.overhead_ms).label("avg_overhead"),
                     func.avg(OrderLatency.total_latency_ms).label("avg_total"),
-                    func.sum(case((OrderLatency.total_latency_ms < 150, 1), else_=0)).label(
-                        "under_150"
-                    ),
+                    func.sum(
+                        case((OrderLatency.total_latency_ms < 150, 1), else_=0)
+                    ).label("under_150"),
                 )
                 .filter(OrderLatency.broker.isnot(None))
                 .group_by(OrderLatency.broker)
@@ -195,7 +205,9 @@ class OrderLatency(LatencyBase):
             if broker_agg:
                 broker_names = [b.broker for b in broker_agg]
                 latency_rows = (
-                    latency_session.query(OrderLatency.broker, OrderLatency.total_latency_ms)
+                    latency_session.query(
+                        OrderLatency.broker, OrderLatency.total_latency_ms
+                    )
                     .filter(
                         OrderLatency.broker.in_(broker_names),
                         OrderLatency.total_latency_ms.isnot(None),
@@ -214,7 +226,9 @@ class OrderLatency(LatencyBase):
                 broker = broker_row.broker
                 broker_total = broker_row.total or 0
                 broker_under_150 = broker_row.under_150 or 0
-                broker_sla = (broker_under_150 / broker_total * 100) if broker_total else 0
+                broker_sla = (
+                    (broker_under_150 / broker_total * 100) if broker_total else 0
+                )
 
                 # Calculate percentiles for this broker
                 broker_p50 = broker_p99 = 0
@@ -236,9 +250,11 @@ class OrderLatency(LatencyBase):
             return {
                 "total_orders": total_orders,
                 "failed_orders": failed_orders,
-                "success_rate": ((total_orders - failed_orders) / total_orders * 100)
-                if total_orders
-                else 0,
+                "success_rate": (
+                    ((total_orders - failed_orders) / total_orders * 100)
+                    if total_orders
+                    else 0
+                ),
                 "avg_rtt": float(avg_rtt),
                 "avg_overhead": float(avg_overhead),
                 "avg_total": float(avg_total),
@@ -273,11 +289,12 @@ class OrderLatency(LatencyBase):
 
 def init_latency_db():
     """Initialize the latency database"""
-    # Extract directory from database URL and create if it doesn't exist
-    db_path = LATENCY_DATABASE_URL.replace("sqlite:///", "")
-    db_dir = os.path.dirname(db_path)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
+    if LATENCY_DATABASE_URL and "sqlite" in LATENCY_DATABASE_URL:
+        # Extract directory from database URL and create if it doesn't exist
+        db_path = LATENCY_DATABASE_URL.replace("sqlite:///", "")
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
 
     from database.db_init_helper import init_db_with_logging
 
@@ -311,12 +328,17 @@ def purge_old_data_logs(days=7):
         # Delete non-order logs older than cutoff
         deleted = (
             latency_session.query(OrderLatency)
-            .filter(OrderLatency.timestamp < cutoff, ~OrderLatency.order_type.in_(ORDER_TYPES))
+            .filter(
+                OrderLatency.timestamp < cutoff,
+                ~OrderLatency.order_type.in_(ORDER_TYPES),
+            )
             .delete(synchronize_session=False)
         )
 
         latency_session.commit()
-        logger.debug(f"Purged {deleted} old data endpoint latency logs (older than {days} days)")
+        logger.debug(
+            f"Purged {deleted} old data endpoint latency logs (older than {days} days)"
+        )
         return deleted
     except Exception as e:
         logger.exception(f"Error purging old latency logs: {str(e)}")

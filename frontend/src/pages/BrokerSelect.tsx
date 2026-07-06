@@ -15,6 +15,7 @@ import { useAuthStore } from '@/stores/authStore'
 
 // All supported brokers with their display names and auth types
 const allBrokers = [
+  { id: 'alpaca', name: 'Alpaca', authType: 'oauth' },
   { id: 'fivepaisa', name: '5 Paisa', authType: 'totp' },
   { id: 'fivepaisaxts', name: '5 Paisa (XTS)', authType: 'totp' },
   { id: 'aliceblue', name: 'Alice Blue', authType: 'totp' },
@@ -186,6 +187,13 @@ export default function BrokerSelect() {
         loginUrl = `https://trade.pocketful.in/oauth2/auth?client_id=${broker_api_key}&redirect_uri=${redirect_url}&response_type=code&scope=${encodeURIComponent(scope)}&state=${encodeURIComponent(state)}`
         break
       }
+        
+      case 'alpaca':
+        const state = generateRandomState()
+        localStorage.setItem('alpaca_oauth_state', state)
+        const scope = 'trading data'
+        loginUrl = `https://app.alpaca.markets/oauth/authorize?response_type=code&client_id=${broker_api_key}&redirect_uri=${redirect_url}&state=${encodeURIComponent(state)}&scope=${encodeURIComponent(scope)}`
+        break
 
       default:
         setError('Please select a broker')

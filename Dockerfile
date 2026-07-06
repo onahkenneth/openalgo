@@ -31,7 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenblas0 \
     libgomp1 \
     libgfortran5 && \
-    ln -fs /usr/share/zoneinfo/Asia/Kolkata /etc/localtime && \
+    ln -fs /usr/share/zoneinfo/Africa/Johannesburg /etc/localtime && \
     dpkg-reconfigure -f noninteractive tzdata && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 # 1 – user & workdir
@@ -58,7 +58,7 @@ RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    TZ=Asia/Kolkata \
+    TZ=Africa/Johannesburg \
     APP_MODE=standalone \
     TMPDIR=/app/tmp \
     NUMBA_CACHE_DIR=/app/tmp/numba_cache \

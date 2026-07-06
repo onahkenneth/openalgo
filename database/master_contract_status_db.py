@@ -3,7 +3,17 @@ import logging
 import os
 from datetime import datetime, date, timedelta
 
-from sqlalchemy import Boolean, Column, Date, DateTime, Integer, String, Text, create_engine, text
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Date,
+    DateTime,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    text,
+)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -16,12 +26,12 @@ DOWNLOAD_TIMEOUT_MINUTES = 5
 # Get the database path from environment variable or use default
 DB_PATH = os.getenv("DATABASE_URL", "sqlite:///db/openalgo.db")
 
-# Ensure the directory exists
-os.makedirs(os.path.dirname(DB_PATH.replace("sqlite:///", "")), exist_ok=True)
-
 # Create the engine and session
 # Conditionally create engine based on DB type
 if DB_PATH and "sqlite" in DB_PATH:
+    # Ensure the directory exists
+    os.makedirs(os.path.dirname(DB_PATH.replace("sqlite:///", "")), exist_ok=True)
+
     # SQLite: Use NullPool to prevent connection pool exhaustion
     engine = create_engine(
         DB_PATH,
@@ -31,7 +41,9 @@ if DB_PATH and "sqlite" in DB_PATH:
     )
 else:
     # For other databases like PostgreSQL, use connection pooling
-    engine = create_engine(DB_PATH, echo=False, pool_size=50, max_overflow=100, pool_timeout=10)
+    engine = create_engine(
+        DB_PATH, echo=False, pool_size=50, max_overflow=100, pool_timeout=10
+    )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
@@ -48,9 +60,13 @@ class MasterContractStatus(Base):
     is_ready = Column(Boolean, default=False)
 
     # Smart download tracking columns
-    last_download_time = Column(DateTime, nullable=True)  # When download completed successfully
-    download_date = Column(Date, nullable=True)           # Trading day of the download
-    exchange_stats = Column(Text, nullable=True)          # JSON: {"NSE": 2500, "NFO": 85000, ...}
+    last_download_time = Column(
+        DateTime, nullable=True
+    )  # When download completed successfully
+    download_date = Column(Date, nullable=True)  # Trading day of the download
+    exchange_stats = Column(
+        Text, nullable=True
+    )  # JSON: {"NSE": 2500, "NFO": 85000, ...}
     download_duration_seconds = Column(Integer, nullable=True)  # How long download took
 
 
@@ -96,7 +112,9 @@ def update_status(broker, status, message, total_symbols=None):
     """Update the download status for a broker"""
     session = SessionLocal()
     try:
-        broker_status = session.query(MasterContractStatus).filter_by(broker=broker).first()
+        broker_status = (
+            session.query(MasterContractStatus).filter_by(broker=broker).first()
+        )
 
         if broker_status:
             broker_status.status = status
@@ -140,7 +158,8 @@ def get_status(broker):
             if (
                 status.status == "downloading"
                 and status.last_updated
-                and datetime.now() - status.last_updated > timedelta(minutes=DOWNLOAD_TIMEOUT_MINUTES)
+                and datetime.now() - status.last_updated
+                > timedelta(minutes=DOWNLOAD_TIMEOUT_MINUTES)
             ):
                 logger.warning(
                     f"Download for {broker} stuck for >{DOWNLOAD_TIMEOUT_MINUTES}min, marking as error"
@@ -166,12 +185,20 @@ def get_status(broker):
                 "broker": status.broker,
                 "status": status.status,
                 "message": status.message,
-                "last_updated": status.last_updated.isoformat() if status.last_updated else None,
+                "last_updated": (
+                    status.last_updated.isoformat() if status.last_updated else None
+                ),
                 "total_symbols": status.total_symbols,
                 "is_ready": status.is_ready,
                 # Smart download fields
-                "last_download_time": status.last_download_time.isoformat() if status.last_download_time else None,
-                "download_date": status.download_date.isoformat() if status.download_date else None,
+                "last_download_time": (
+                    status.last_download_time.isoformat()
+                    if status.last_download_time
+                    else None
+                ),
+                "download_date": (
+                    status.download_date.isoformat() if status.download_date else None
+                ),
                 "exchange_stats": exchange_stats,
                 "download_duration_seconds": status.download_duration_seconds,
             }
@@ -279,14 +306,18 @@ def get_exchange_stats_from_db():
     try:
         # Query symtoken table directly using raw SQL
         with engine.connect() as conn:
-            result = conn.execute(text("""
+            result = conn.execute(
+                text(
+                    """
                 SELECT
                     exchange,
                     COUNT(*) as total
                 FROM symtoken
                 GROUP BY exchange
                 ORDER BY total DESC
-            """)).fetchall()
+            """
+                )
+            ).fetchall()
 
             stats = {}
             for row in result:

@@ -18,7 +18,16 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Float, Integer, String, create_engine
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    Integer,
+    String,
+    create_engine,
+)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.pool import NullPool
@@ -33,7 +42,9 @@ HEALTH_DATABASE_URL = os.getenv("HEALTH_DATABASE_URL", "sqlite:///db/health.db")
 if HEALTH_DATABASE_URL and "sqlite" in HEALTH_DATABASE_URL:
     # SQLite: Use NullPool to prevent connection pool exhaustion
     health_engine = create_engine(
-        HEALTH_DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
+        HEALTH_DATABASE_URL,
+        poolclass=NullPool,
+        connect_args={"check_same_thread": False},
     )
 else:
     # For other databases like PostgreSQL, use connection pooling
@@ -133,16 +144,26 @@ class HealthMetric(HealthBase):
                 # File Descriptors
                 fd_count=fd_metrics.get("count") if fd_metrics else None,
                 fd_limit=fd_metrics.get("limit") if fd_metrics else None,
-                fd_usage_percent=fd_metrics.get("usage_percent") if fd_metrics else None,
+                fd_usage_percent=(
+                    fd_metrics.get("usage_percent") if fd_metrics else None
+                ),
                 fd_available=fd_metrics.get("available") if fd_metrics else None,
                 fd_status=fd_metrics.get("status") if fd_metrics else "unknown",
                 # Memory
                 memory_rss_mb=memory_metrics.get("rss_mb") if memory_metrics else None,
                 memory_vms_mb=memory_metrics.get("vms_mb") if memory_metrics else None,
-                memory_percent=memory_metrics.get("percent") if memory_metrics else None,
-                memory_available_mb=memory_metrics.get("available_mb") if memory_metrics else None,
-                memory_swap_mb=memory_metrics.get("swap_mb") if memory_metrics else None,
-                memory_status=memory_metrics.get("status") if memory_metrics else "unknown",
+                memory_percent=(
+                    memory_metrics.get("percent") if memory_metrics else None
+                ),
+                memory_available_mb=(
+                    memory_metrics.get("available_mb") if memory_metrics else None
+                ),
+                memory_swap_mb=(
+                    memory_metrics.get("swap_mb") if memory_metrics else None
+                ),
+                memory_status=(
+                    memory_metrics.get("status") if memory_metrics else "unknown"
+                ),
                 # Database
                 db_connections_total=db_metrics.get("total") if db_metrics else None,
                 db_connections=db_metrics.get("connections") if db_metrics else None,
@@ -150,13 +171,21 @@ class HealthMetric(HealthBase):
                 # WebSocket
                 ws_connections_total=ws_metrics.get("total") if ws_metrics else None,
                 ws_connections=ws_metrics.get("connections") if ws_metrics else None,
-                ws_total_symbols=ws_metrics.get("total_symbols") if ws_metrics else None,
+                ws_total_symbols=(
+                    ws_metrics.get("total_symbols") if ws_metrics else None
+                ),
                 ws_status=ws_metrics.get("status") if ws_metrics else "unknown",
                 # Threads
                 thread_count=thread_metrics.get("count") if thread_metrics else None,
-                stuck_threads=thread_metrics.get("stuck_count") if thread_metrics else None,
-                thread_details=thread_metrics.get("threads") if thread_metrics else None,
-                thread_status=thread_metrics.get("status") if thread_metrics else "unknown",
+                stuck_threads=(
+                    thread_metrics.get("stuck_count") if thread_metrics else None
+                ),
+                thread_details=(
+                    thread_metrics.get("threads") if thread_metrics else None
+                ),
+                thread_status=(
+                    thread_metrics.get("status") if thread_metrics else "unknown"
+                ),
                 # Processes
                 process_details=process_metrics if process_metrics else None,
                 # Overall
@@ -185,7 +214,9 @@ class HealthMetric(HealthBase):
         """Get recent metrics ordered by timestamp"""
         try:
             return (
-                HealthMetric.query.order_by(HealthMetric.timestamp.desc()).limit(limit).all()
+                HealthMetric.query.order_by(HealthMetric.timestamp.desc())
+                .limit(limit)
+                .all()
             )
         except Exception as e:
             logger.exception(f"Error getting recent metrics: {str(e)}")
@@ -232,12 +263,18 @@ class HealthMetric(HealthBase):
 
             # Calculate statistics
             fd_counts = [m.fd_count for m in metrics if m.fd_count is not None]
-            memory_rss = [m.memory_rss_mb for m in metrics if m.memory_rss_mb is not None]
+            memory_rss = [
+                m.memory_rss_mb for m in metrics if m.memory_rss_mb is not None
+            ]
             db_conns = [
-                m.db_connections_total for m in metrics if m.db_connections_total is not None
+                m.db_connections_total
+                for m in metrics
+                if m.db_connections_total is not None
             ]
             ws_conns = [
-                m.ws_connections_total for m in metrics if m.ws_connections_total is not None
+                m.ws_connections_total
+                for m in metrics
+                if m.ws_connections_total is not None
             ]
             threads = [m.thread_count for m in metrics if m.thread_count is not None]
 
@@ -294,7 +331,8 @@ class HealthMetric(HealthBase):
                 },
                 "status": {
                     "overall": {
-                        "pass": len(metrics) - (overall_warn_count + overall_fail_count),
+                        "pass": len(metrics)
+                        - (overall_warn_count + overall_fail_count),
                         "warn": overall_warn_count,
                         "fail": overall_fail_count,
                     },
@@ -332,7 +370,9 @@ class HealthAlert(HealthBase):
     resolved_at = Column(DateTime(timezone=True))
 
     @staticmethod
-    def create_alert(alert_type, severity, metric_name, metric_value, threshold_value, message):
+    def create_alert(
+        alert_type, severity, metric_name, metric_value, threshold_value, message
+    ):
         """Create a new alert"""
         try:
             # Check if similar alert already exists (not resolved)
@@ -418,7 +458,9 @@ class HealthAlert(HealthBase):
         """Automatically resolve alerts when metrics return to healthy range"""
         try:
             # Get active alerts for this metric
-            alerts = HealthAlert.query.filter_by(metric_name=metric_name, resolved=False).all()
+            alerts = HealthAlert.query.filter_by(
+                metric_name=metric_name, resolved=False
+            ).all()
 
             for alert in alerts:
                 # Resolve if current value is below healthy threshold
@@ -438,11 +480,12 @@ class HealthAlert(HealthBase):
 
 def init_health_db():
     """Initialize the health monitoring database"""
-    # Extract directory from database URL and create if it doesn't exist
-    db_path = HEALTH_DATABASE_URL.replace("sqlite:///", "")
-    db_dir = os.path.dirname(db_path)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
+    if HEALTH_DATABASE_URL and "sqlite" in HEALTH_DATABASE_URL:
+        # Extract directory from database URL and create if it doesn't exist
+        db_path = HEALTH_DATABASE_URL.replace("sqlite:///", "")
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
 
     from database.db_init_helper import init_db_with_logging
 

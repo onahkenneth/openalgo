@@ -1,0 +1,11 @@
+endpoint: https://paper-api.alpaca.markets/v2
+key: PKYPSBMLTIIPWYTWH3QDK23JDL
+secret: 8pr3wdv4isTJVYD1yQxGanBHosyjPGv6eZeJLEBkLqqF
+
+endpoint: https://api.alpaca.markets
+key: AK5SXJIFDFWJTP4GPCC4FUKF37
+secret: E7QU7FWdQ4e7FWUDKYcxWytM4ts2FEen3mCpEpuXueNz
+
+
+client_id: cae435890152212e5e2feabdd5176a69
+client_secret: f289922d27a5e3951edbfeee5bc97f5665be202d

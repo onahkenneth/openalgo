@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from db_compat import get_table_columns, table_exists
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -66,10 +67,8 @@ def update_reset_day_default(conn):
     """Update reset_day from Sunday to Never for existing databases"""
     try:
         # Check if sandbox_config table exists
-        result = conn.execute(
-            text("SELECT name FROM sqlite_master WHERE type='table' AND name='sandbox_config'")
-        )
-        if not result.fetchone():
+        result = table_exists(conn, "sandbox_config")
+        if not result:
             logger.info("sandbox_config table does not exist, skipping reset_day update")
             return
 
@@ -97,8 +96,7 @@ def add_today_realized_pnl_columns(conn):
     logger.info("Checking for today_realized_pnl columns...")
 
     # Check and add today_realized_pnl to sandbox_positions if missing
-    result = conn.execute(text("PRAGMA table_info(sandbox_positions)"))
-    columns = [row[1] for row in result]
+    columns = get_table_columns(conn, "sandbox_positions")
 
     if "today_realized_pnl" not in columns:
         conn.execute(
@@ -112,8 +110,7 @@ def add_today_realized_pnl_columns(conn):
         logger.info("today_realized_pnl column already exists in sandbox_positions")
 
     # Check and add today_realized_pnl to sandbox_funds if missing
-    result = conn.execute(text("PRAGMA table_info(sandbox_funds)"))
-    columns = [row[1] for row in result]
+    columns = get_table_columns(conn, "sandbox_funds")
 
     if "today_realized_pnl" not in columns:
         conn.execute(
@@ -163,12 +160,10 @@ def status():
 
         with engine.connect() as conn:
             # Check today_realized_pnl in sandbox_positions
-            result = conn.execute(text("PRAGMA table_info(sandbox_positions)"))
-            positions_columns = [row[1] for row in result]
+            positions_columns = get_table_columns(conn, "sandbox_positions")
 
             # Check today_realized_pnl in sandbox_funds
-            result = conn.execute(text("PRAGMA table_info(sandbox_funds)"))
-            funds_columns = [row[1] for row in result]
+            funds_columns = get_table_columns(conn, "sandbox_funds")
 
             missing = []
             if "today_realized_pnl" not in positions_columns:

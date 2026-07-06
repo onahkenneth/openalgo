@@ -16,8 +16,7 @@ import logging
 from datetime import datetime
 
 from sqlalchemy import Boolean, Column, DateTime, String, Text, create_engine, inspect
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -89,7 +88,9 @@ def add_feed_token_column():
             conn.commit()  # Commit the transaction
             logger.info("feed_token column added successfully.")
         else:
-            logger.info("feed_token column already exists in auth table. No action needed.")
+            logger.info(
+                "feed_token column already exists in auth table. No action needed."
+            )
 
         conn.close()
         return True

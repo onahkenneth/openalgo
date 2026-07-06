@@ -1,5 +1,18 @@
+import os
+
+if os.environ.get("DEBUG_PORT"):
+    import debugpy
+
+    debug_port = int(os.environ.get("DEBUG_PORT", 5678))
+    debugpy.listen(("0.0.0.0", debug_port))
+    print(f"⏳ debugpy listening on port {debug_port}, attach VS Code anytime...")
+
+from werkzeug.debug import DebuggedApplication
+
 # Load and check environment variables before anything else
-from utils.env_check import load_and_check_env_variables  # Import the environment check function
+from utils.env_check import (
+    load_and_check_env_variables,
+)  # Import the environment check function
 
 load_and_check_env_variables()
 
@@ -51,7 +64,10 @@ from blueprints.orders import orders_bp
 from blueprints.platforms import platforms_bp
 from blueprints.playground import playground_bp  # Import the API playground blueprint
 from blueprints.pnltracker import pnltracker_bp  # Import the pnl tracker blueprint
-from blueprints.python_strategy import python_strategy_bp, initialize_with_app_context as init_python_strategy  # Import the python strategy blueprint
+from blueprints.python_strategy import (
+    python_strategy_bp,
+    initialize_with_app_context as init_python_strategy,
+)  # Import the python strategy blueprint
 from blueprints.react_app import (  # Import React frontend blueprint
     is_react_frontend_available,
     react_bp,
@@ -68,7 +84,9 @@ from blueprints.system_permissions import (
 from blueprints.telegram import telegram_bp  # Import the telegram blueprint
 from blueprints.traffic import traffic_bp  # Import the traffic blueprint
 from blueprints.tv_json import tv_json_bp
-from blueprints.websocket_example import websocket_bp  # Import the websocket example blueprint
+from blueprints.websocket_example import (
+    websocket_bp,
+)  # Import the websocket example blueprint
 from cors import cors  # Import the CORS instance
 from csp import apply_csp_middleware  # Import the CSP middleware
 from database.action_center_db import init_db as ensure_action_center_tables_exists
@@ -88,7 +106,7 @@ from database.traffic_db import init_logs_db as ensure_traffic_logs_exists
 from database.user_db import init_db as ensure_user_tables_exists
 from extensions import socketio  # Import SocketIO
 from limiter import limiter  # Import the Limiter instance
-from restx_api import api, api_v1_bp
+from restx_api import api_v1_bp
 from services.telegram_bot_service import telegram_bot_service
 from utils.latency_monitor import init_latency_monitoring  # Import latency monitoring
 from utils.health_monitor import init_health_monitoring  # Import health monitoring
@@ -98,7 +116,9 @@ from utils.logging import (  # Import centralized logging
     log_startup_banner,
 )
 from utils.plugin_loader import load_broker_auth_functions
-from utils.security_middleware import init_security_middleware  # Import security middleware
+from utils.security_middleware import (
+    init_security_middleware,
+)  # Import security middleware
 from utils.socketio_error_handler import (
     init_socketio_error_handling,  # Import Socket.IO error handler
 )
@@ -200,7 +220,9 @@ def create_app():
         app.register_blueprint(react_bp)
         logger.debug("React frontend enabled (frontend/dist found)")
     else:
-        logger.warning("React frontend not available - run 'npm run build' in frontend/")
+        logger.warning(
+            "React frontend not available - run 'npm run build' in frontend/"
+        )
 
     app.register_blueprint(api_v1_bp)
 
@@ -251,8 +273,12 @@ def create_app():
     app.register_blueprint(ivsmile_bp)  # Register IV Smile blueprint
     app.register_blueprint(oiprofile_bp)  # Register OI Profile blueprint
     app.register_blueprint(flow_bp)  # Register Flow blueprint
-    app.register_blueprint(broker_credentials_bp)  # Register Broker credentials blueprint
-    app.register_blueprint(system_permissions_bp)  # Register System permissions blueprint
+    app.register_blueprint(
+        broker_credentials_bp
+    )  # Register Broker credentials blueprint
+    app.register_blueprint(
+        system_permissions_bp
+    )  # Register System permissions blueprint
 
     # Exempt webhook endpoints from CSRF protection after app initialization
     with app.app_context():
@@ -301,9 +327,13 @@ def create_app():
                     if success:
                         success, message = telegram_bot_service.start_bot()
                         if success:
-                            logger.debug(f"Telegram bot auto-started successfully: {message}")
+                            logger.debug(
+                                f"Telegram bot auto-started successfully: {message}"
+                            )
                         else:
-                            logger.error(f"Failed to auto-start Telegram bot: {message}")
+                            logger.error(
+                                f"Failed to auto-start Telegram bot: {message}"
+                            )
                     else:
                         logger.error(f"Failed to initialize Telegram bot: {message}")
                 else:
@@ -331,11 +361,17 @@ def create_app():
                                         f"Telegram bot auto-started successfully: {message}"
                                     )
                                 else:
-                                    logger.error(f"Failed to auto-start Telegram bot: {message}")
+                                    logger.error(
+                                        f"Failed to auto-start Telegram bot: {message}"
+                                    )
                             else:
-                                logger.error(f"Failed to initialize Telegram bot: {message}")
+                                logger.error(
+                                    f"Failed to initialize Telegram bot: {message}"
+                                )
                         except Exception as e:
-                            logger.error(f"Error in Telegram bot background startup: {e}")
+                            logger.error(
+                                f"Error in Telegram bot background startup: {e}"
+                            )
 
                     # Start in background - don't wait for completion
                     thread = threading.Thread(target=init_and_start_bot, daemon=True)
@@ -378,7 +414,9 @@ def create_app():
 
         # Check if user is logged in and session is expired
         if session.get("logged_in") and not is_session_valid():
-            logger.info(f"Session expired for user: {session.get('user')} - revoking tokens")
+            logger.info(
+                f"Session expired for user: {session.get('user')} - revoking tokens"
+            )
             revoke_user_tokens(revoke_db_tokens=False)
             session.clear()
             # Don't redirect here, let individual routes handle it
@@ -395,12 +433,15 @@ def create_app():
         # Check if it's a CSRF error
         if "CSRF" in error_description or "csrf" in error_description.lower():
             if request.is_json or request.path.startswith("/api"):
-                return jsonify(
-                    {
-                        "error": "CSRF validation failed",
-                        "message": "Security token expired or invalid. Please refresh the page and try again.",
-                    }
-                ), 400
+                return (
+                    jsonify(
+                        {
+                            "error": "CSRF validation failed",
+                            "message": "Security token expired or invalid. Please refresh the page and try again.",
+                        }
+                    ),
+                    400,
+                )
             else:
                 flash("Security token expired. Please try again.", "error")
                 return redirect(request.referrer or url_for("auth.login"))
@@ -468,7 +509,8 @@ def create_app():
 
         # Determine if webhook URL is externally accessible
         is_localhost = any(
-            local in host_server.lower() for local in ["localhost", "127.0.0.1", "0.0.0.0"]
+            local in host_server.lower()
+            for local in ["localhost", "127.0.0.1", "0.0.0.0"]
         )
 
         return jsonify({"host_server": host_server, "is_localhost": is_localhost})
@@ -575,7 +617,9 @@ with app.app_context():
             symbol_count = cache_result["symbol_cache"].get("symbols_loaded", 0)
             auth_count = cache_result["auth_cache"].get("tokens_loaded", 0)
             if symbol_count > 0 or auth_count > 0:
-                logger.debug(f"Cache restoration: {symbol_count} symbols, {auth_count} auth tokens")
+                logger.debug(
+                    f"Cache restoration: {symbol_count} symbols, {auth_count} auth tokens"
+                )
     except Exception as e:
         logger.debug(f"Cache restoration skipped: {e}")
 
@@ -621,9 +665,13 @@ with app.app_context():
                         service_name, success, message = future.result()
                         if service_name == "execution_engine":
                             if success:
-                                logger.debug("Execution engine auto-started (Analyzer mode is ON)")
+                                logger.debug(
+                                    "Execution engine auto-started (Analyzer mode is ON)"
+                                )
                             else:
-                                logger.warning(f"Failed to auto-start execution engine: {message}")
+                                logger.warning(
+                                    f"Failed to auto-start execution engine: {message}"
+                                )
                         elif service_name == "squareoff_scheduler":
                             if success:
                                 logger.debug(
@@ -634,7 +682,9 @@ with app.app_context():
                                     f"Failed to auto-start square-off scheduler: {message}"
                                 )
                         elif service_name == "catchup_settlement":
-                            logger.debug("Catch-up settlement check completed on startup")
+                            logger.debug(
+                                "Catch-up settlement check completed on startup"
+                            )
                     except Exception as e:
                         logger.error(f"Error starting service: {e}")
 
@@ -643,36 +693,42 @@ with app.app_context():
     except Exception as e:
         logger.error(f"Error checking analyzer mode on startup: {e}")
 
+
 # Database session cleanup (teardown handler)
 @app.teardown_appcontext
 def shutdown_database_sessions(exception=None):
     """Remove scoped sessions after each request to prevent FD leaks"""
     try:
         from database.auth_db import db_session
+
         db_session.remove()
     except Exception as e:
         logger.error(f"Error removing auth db_session: {e}")
 
     try:
         from database.traffic_db import logs_session
+
         logs_session.remove()
     except Exception as e:
         logger.error(f"Error removing logs_session: {e}")
 
     try:
         from database.apilog_db import db_session as apilog_session
+
         apilog_session.remove()
     except Exception as e:
         logger.error(f"Error removing apilog_session: {e}")
 
     try:
         from database.latency_db import latency_session
+
         latency_session.remove()
     except Exception as e:
         logger.error(f"Error removing latency_session: {e}")
 
     try:
         from database.health_db import health_session
+
         health_session.remove()
     except Exception as e:
         logger.error(f"Error removing health_session: {e}")
@@ -697,7 +753,9 @@ else:
 # Start Flask development server with SocketIO support if directly executed
 if __name__ == "__main__":
     # Get environment variables
-    host_ip = os.getenv("FLASK_HOST_IP", "127.0.0.1")  # Default to '127.0.0.1' if not set
+    host_ip = os.getenv(
+        "FLASK_HOST_IP", "127.0.0.1"
+    )  # Default to '127.0.0.1' if not set
     port = int(os.getenv("FLASK_PORT", 5000))  # Default to 5000 if not set
     ws_port = int(os.getenv("WEBSOCKET_PORT", 8765))  # WebSocket port
     debug = os.getenv("FLASK_DEBUG", "False").lower() in (
@@ -785,10 +843,13 @@ if __name__ == "__main__":
         ]
         # Add Host URL to samples if ngrok is enabled (for width calculation)
         if host_server:
-            content_samples.insert(5, f"{WHITE}Host URL{RESET}   {GREEN}{host_server}{RESET}")
+            content_samples.insert(
+                5, f"{WHITE}Host URL{RESET}   {GREEN}{host_server}{RESET}"
+            )
 
         inner_target = max(
-            MIN_WIDTH - 4, max((visible_len(text) for text in content_samples), default=0)
+            MIN_WIDTH - 4,
+            max((visible_len(text) for text in content_samples), default=0),
         )
         W = max(inner_target + 4, len(title) + 5)
 
@@ -809,10 +870,14 @@ if __name__ == "__main__":
             return f"{B}{V}{RESET} {text}{' ' * padding} {B}{V}{RESET}"
 
         # Build banner
-        top_dashes = max(0, W - 5 - len(title))  # ensures non-negative padding around the title
+        top_dashes = max(
+            0, W - 5 - len(title)
+        )  # ensures non-negative padding around the title
 
         print()
-        print(f"{B}{TL}{H * 3}{GREEN}{BOLD}{title}{RESET}{B}{H * top_dashes}{TR}{RESET}")
+        print(
+            f"{B}{TL}{H * 3}{GREEN}{BOLD}{title}{RESET}{B}{H * top_dashes}{TR}{RESET}"
+        )
         print(mkline())
 
         # Centered slogan
@@ -844,4 +909,6 @@ if __name__ == "__main__":
             "*.bak",
         ]
     }
-    socketio.run(app, host=host_ip, port=port, debug=debug, reloader_options=reloader_options)
+    socketio.run(
+        app, host=host_ip, port=port, debug=debug, reloader_options=reloader_options
+    )
