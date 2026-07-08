@@ -16,26 +16,23 @@ from services.option_greeks_service import (
     DEFAULT_INTEREST_RATES,
     parse_option_symbol,
 )
+from services.strategy_chart_service import (
+    _cap_last_n_trading_dates,
+    _resolve_trading_window,
+)
 from services.option_symbol_service import (
+    construct_crypto_option_symbol,
     construct_option_symbol,
     find_atm_strike_from_actual,
     get_available_strikes,
     get_option_exchange,
 )
+from database.token_db_enhanced import fno_search_symbols
 from services.quotes_service import get_quotes
+from utils.constants import CRYPTO_EXCHANGES, INSTRUMENT_PERPFUT
 from utils.logging import get_logger
 
-# Import py_vollib for Black-76 IV and Greeks calculation
-try:
-    from py_vollib.black.greeks.analytical import delta as black_delta
-    from py_vollib.black.greeks.analytical import gamma as black_gamma
-    from py_vollib.black.greeks.analytical import theta as black_theta
-    from py_vollib.black.greeks.analytical import vega as black_vega
-    from py_vollib.black.implied_volatility import implied_volatility as black_iv
-
-    PYVOLLIB_AVAILABLE = True
-except ImportError:
-    PYVOLLIB_AVAILABLE = False
+# opengreeks is lazy-loaded inside _calculate_iv_series() and get_iv_chart_data().
 
 logger = get_logger(__name__)
 
@@ -92,6 +89,9 @@ def _get_quote_exchange(base_symbol, underlying_exchange):
         return "BSE_INDEX"
     if underlying_exchange.upper() in ("NFO", "BFO"):
         return "NSE" if underlying_exchange.upper() == "NFO" else "BSE"
+    # Crypto options — underlying is on the same exchange
+    if underlying_exchange.upper() in CRYPTO_EXCHANGES:
+        return underlying_exchange.upper()
     return underlying_exchange.upper()
 
 
@@ -154,36 +154,46 @@ def get_iv_chart_data(
     Returns:
         Tuple of (success, response_dict, status_code)
     """
-    if not PYVOLLIB_AVAILABLE:
+    try:
+        from opengreeks.black76 import implied_volatility as black_iv  # noqa: F401
+    except ImportError:
         return (
             False,
             {
                 "status": "error",
-                "message": "py_vollib library required for IV calculation. Install with: pip install py_vollib",
+                "message": "opengreeks library required for IV calculation. Install with: pip install opengreeks",
             },
             500,
         )
 
     try:
         ist = pytz.timezone("Asia/Kolkata")
-        today = datetime.now(ist).date()
-        # If today is a weekend (Saturday=5, Sunday=6), use last Friday
-        weekday = today.weekday()
-        if weekday == 5:  # Saturday
-            today = today - timedelta(days=1)
-        elif weekday == 6:  # Sunday
-            today = today - timedelta(days=2)
-        end_date_str = today.strftime("%Y-%m-%d")
-        start_date_str = (today - timedelta(days=max(1, days) - 1)).strftime("%Y-%m-%d")
+        # Generous calendar window; the returned IV series is post-filtered
+        # to the last N distinct trading dates that actually have data.
+        start_date_str, end_date_str = _resolve_trading_window(days, ist)
 
         # Step 1: Determine quote exchange and options exchange
         base_symbol = underlying.upper()
         quote_exchange = _get_quote_exchange(base_symbol, exchange)
         options_exchange = get_option_exchange(quote_exchange)
+        # CRYPTO: look up the canonical perpetual symbol from cache (e.g. BTC → BTCUSDFUT)
+        if exchange.upper() in CRYPTO_EXCHANGES:
+            _perp = fno_search_symbols(
+                query=f"{base_symbol}USDFUT", exchange=exchange, instrumenttype=INSTRUMENT_PERPFUT, limit=1
+            )
+            if not _perp:
+                return (
+                    False,
+                    {"status": "error", "message": f"No perpetual futures found for {base_symbol} on {exchange}"},
+                    404,
+                )
+            underlying_quote_symbol = _perp[0]["symbol"]
+        else:
+            underlying_quote_symbol = base_symbol
 
         # Step 2: Get underlying LTP to resolve ATM strike
         success, quote_response, status_code = get_quotes(
-            symbol=base_symbol,
+            symbol=underlying_quote_symbol,
             exchange=quote_exchange,
             api_key=api_key,
         )
@@ -213,8 +223,9 @@ def get_iv_chart_data(
         if atm_strike is None:
             return False, {"status": "error", "message": "Could not determine ATM strike"}, 400
 
-        ce_symbol = construct_option_symbol(base_symbol, expiry_date.upper(), atm_strike, "CE")
-        pe_symbol = construct_option_symbol(base_symbol, expiry_date.upper(), atm_strike, "PE")
+        _build_sym = construct_crypto_option_symbol if exchange.upper() in CRYPTO_EXCHANGES else construct_option_symbol
+        ce_symbol = _build_sym(base_symbol, expiry_date.upper(), atm_strike, "CE")
+        pe_symbol = _build_sym(base_symbol, expiry_date.upper(), atm_strike, "PE")
 
         # Step 4: Parse option symbols to get expiry datetime
         _, expiry_dt, strike, _ = parse_option_symbol(ce_symbol, options_exchange)
@@ -228,7 +239,7 @@ def get_iv_chart_data(
         underlying_history_exchange = quote_exchange
         # For index symbols like NIFTY on NSE_INDEX, the history service needs the right exchange
         success_u, resp_u, _ = get_history(
-            symbol=base_symbol,
+            symbol=underlying_quote_symbol,
             exchange=underlying_history_exchange,
             interval=interval,
             start_date=start_date_str,
@@ -321,6 +332,14 @@ def get_iv_chart_data(
                 404,
             )
 
+        # Trim each leg's iv_data to the last N distinct trading dates with
+        # data. Using the same helper as strategy-chart / straddle keeps the
+        # "last 3 days = last 3 trading days with data" behaviour consistent
+        # across every /tools page.
+        for entry in series_results:
+            if "iv_data" in entry and isinstance(entry["iv_data"], list):
+                entry["iv_data"] = _cap_last_n_trading_dates(entry["iv_data"], days, ist)
+
         return (
             True,
             {
@@ -358,6 +377,14 @@ def _calculate_iv_series(df_option, df_underlying, strike, expiry_dt, flag, inte
     Returns:
         List of dicts with time (unix seconds), iv, option_price, underlying_price
     """
+    from opengreeks.black76 import (
+        delta as black_delta,
+        gamma as black_gamma,
+        implied_volatility as black_iv,
+        theta as black_theta,
+        vega as black_vega,
+    )
+
     iv_data = []
 
     # Align on common timestamps using inner join
@@ -437,10 +464,24 @@ def get_default_symbols(underlying, exchange, expiry_date, api_key):
         base_symbol = underlying.upper()
         quote_exchange = _get_quote_exchange(base_symbol, exchange)
         options_exchange = get_option_exchange(quote_exchange)
+        if exchange.upper() in CRYPTO_EXCHANGES:
+            _perp = fno_search_symbols(
+                query=f"{base_symbol}USDFUT", exchange=exchange, instrumenttype=INSTRUMENT_PERPFUT, limit=1
+            )
+            if not _perp:
+                return (
+                    False,
+                    {"status": "error", "message": f"No perpetual futures found for {base_symbol} on {exchange}"},
+                    404,
+                )
+            underlying_quote_symbol = _perp[0]["symbol"]
+        else:
+            underlying_quote_symbol = base_symbol
+        _build_sym = construct_crypto_option_symbol if exchange.upper() in CRYPTO_EXCHANGES else construct_option_symbol
 
         # Get underlying LTP
         success, quote_response, status_code = get_quotes(
-            symbol=base_symbol,
+            symbol=underlying_quote_symbol,
             exchange=quote_exchange,
             api_key=api_key,
         )
@@ -462,8 +503,8 @@ def get_default_symbols(underlying, exchange, expiry_date, api_key):
         if atm_strike is None:
             return False, {"status": "error", "message": "Could not determine ATM strike"}, 400
 
-        ce_symbol = construct_option_symbol(base_symbol, expiry_date.upper(), atm_strike, "CE")
-        pe_symbol = construct_option_symbol(base_symbol, expiry_date.upper(), atm_strike, "PE")
+        ce_symbol = _build_sym(base_symbol, expiry_date.upper(), atm_strike, "CE")
+        pe_symbol = _build_sym(base_symbol, expiry_date.upper(), atm_strike, "PE")
 
         return (
             True,

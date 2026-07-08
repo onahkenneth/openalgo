@@ -1,24 +1,37 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { OptionChainResponse, OptionStrike } from '@/types/option-chain'
-import { useOptionChainPolling } from './useOptionChainPolling'
 import { useMarketData } from './useMarketData'
+import { useOptionChainPolling } from './useOptionChainPolling'
 
 // Index symbols that use NSE_INDEX/BSE_INDEX for quotes (matches backend lists)
 const NSE_INDEX_SYMBOLS = new Set([
-  'NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY',
-  'NIFTYNXT50', 'NIFTYIT', 'NIFTYPHARMA', 'NIFTYBANK',
+  'NIFTY',
+  'BANKNIFTY',
+  'FINNIFTY',
+  'MIDCPNIFTY',
+  'NIFTYNXT50',
+  'NIFTYIT',
+  'NIFTYPHARMA',
+  'NIFTYBANK',
 ])
 const BSE_INDEX_SYMBOLS = new Set(['SENSEX', 'BANKEX', 'SENSEX50'])
 
 function getUnderlyingExchange(symbol: string, optionExchange: string): string {
+  const normalizedExchange = optionExchange.toUpperCase()
   if (NSE_INDEX_SYMBOLS.has(symbol)) return 'NSE_INDEX'
   if (BSE_INDEX_SYMBOLS.has(symbol)) return 'BSE_INDEX'
-  return optionExchange === 'BFO' ? 'BSE' : 'NSE'
+  if (normalizedExchange === 'CRYPTO') return 'CRYPTO'
+  if (normalizedExchange === 'BFO') return 'BSE'
+  if (normalizedExchange === 'NFO') return 'NSE'
+  return normalizedExchange
 }
 
 // Round price to nearest tick size (e.g., 0.05 for options)
 // Fixes broker WebSocket data that may not be aligned to tick size
-function roundToTickSize(price: number | undefined, tickSize: number | undefined): number | undefined {
+function roundToTickSize(
+  price: number | undefined,
+  tickSize: number | undefined
+): number | undefined {
   if (price === undefined || price === null) return undefined
   if (!tickSize || tickSize <= 0) return price
   // Round to nearest tick and fix floating point precision
@@ -53,7 +66,11 @@ export function useOptionChainLive(
   optionExchange: string,
   expiryDate: string,
   strikeCount: number,
-  options: UseOptionChainLiveOptions = { enabled: true, oiRefreshInterval: 30000, pauseWhenHidden: true }
+  options: UseOptionChainLiveOptions = {
+    enabled: true,
+    oiRefreshInterval: 30000,
+    pauseWhenHidden: true,
+  }
 ) {
   const { enabled, oiRefreshInterval = 30000, pauseWhenHidden = true } = options
 
@@ -83,8 +100,13 @@ export function useOptionChainLive(
 
     // Add underlying symbol for real-time spot price
     // Use correct exchange based on whether it's an index or stock
+    // For CRYPTO: bare underlying (e.g. BTC) isn't tradeable — use perpetual (e.g. BTCUSDFUT)
     const underlyingExch = getUnderlyingExchange(underlying, optionExchange)
-    symbols.push({ symbol: underlying, exchange: underlyingExch })
+    if (underlyingExch === 'CRYPTO') {
+      symbols.push({ symbol: `${underlying}USDFUT`, exchange: underlyingExch })
+    } else {
+      symbols.push({ symbol: underlying, exchange: underlyingExch })
+    }
 
     // Add all option symbols
     if (polledData?.chain) {
@@ -147,8 +169,12 @@ export function useOptionChainLive(
           newStrike.ce = {
             ...strike.ce,
             ltp: roundToTickSize(wsSymbolData.data.ltp, tickSize) ?? strike.ce.ltp,
-            bid: roundToTickSize(depthBuy?.price ?? wsSymbolData.data.bid_price, tickSize) ?? strike.ce.bid,
-            ask: roundToTickSize(depthSell?.price ?? wsSymbolData.data.ask_price, tickSize) ?? strike.ce.ask,
+            bid:
+              roundToTickSize(depthBuy?.price ?? wsSymbolData.data.bid_price, tickSize) ??
+              strike.ce.bid,
+            ask:
+              roundToTickSize(depthSell?.price ?? wsSymbolData.data.ask_price, tickSize) ??
+              strike.ce.ask,
             bid_qty: depthBuy?.quantity ?? wsSymbolData.data.bid_size ?? strike.ce.bid_qty ?? 0,
             ask_qty: depthSell?.quantity ?? wsSymbolData.data.ask_size ?? strike.ce.ask_qty ?? 0,
           }
@@ -167,8 +193,12 @@ export function useOptionChainLive(
           newStrike.pe = {
             ...strike.pe,
             ltp: roundToTickSize(wsSymbolData.data.ltp, tickSize) ?? strike.pe.ltp,
-            bid: roundToTickSize(depthBuy?.price ?? wsSymbolData.data.bid_price, tickSize) ?? strike.pe.bid,
-            ask: roundToTickSize(depthSell?.price ?? wsSymbolData.data.ask_price, tickSize) ?? strike.pe.ask,
+            bid:
+              roundToTickSize(depthBuy?.price ?? wsSymbolData.data.bid_price, tickSize) ??
+              strike.pe.bid,
+            ask:
+              roundToTickSize(depthSell?.price ?? wsSymbolData.data.ask_price, tickSize) ??
+              strike.pe.ask,
             bid_qty: depthBuy?.quantity ?? wsSymbolData.data.bid_size ?? strike.pe.bid_qty ?? 0,
             ask_qty: depthSell?.quantity ?? wsSymbolData.data.ask_size ?? strike.pe.ask_qty ?? 0,
           }

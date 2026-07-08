@@ -1,8 +1,8 @@
 import { BarChart3, BookOpen, LogOut, Menu, Moon, Sun, Zap } from 'lucide-react'
 import { useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { showToast } from '@/utils/toast'
 import { authApi } from '@/api/auth'
+import { LogoutConfirmDialog } from '@/components/auth/LogoutConfirmDialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -20,17 +20,23 @@ import {
   SheetTitle,
   SheetTrigger,
 } from '@/components/ui/sheet'
-import { isActiveRoute, mobileSheetItems, navItems, profileMenuItems } from '@/config/navigation'
+import { isActiveRoute, mobileSheetItems, navItems } from '@/config/navigation'
+import { useProfileMenuItems } from '@/hooks/useProfileMenuItems'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
 import { useThemeStore } from '@/stores/themeStore'
+import { showToast } from '@/utils/toast'
 
 export function Navbar() {
   const location = useLocation()
   const navigate = useNavigate()
   const [mobileOpen, setMobileOpen] = useState(false)
+  const [showLogoutDialog, setShowLogoutDialog] = useState(false)
   const { mode, appMode, toggleMode, toggleAppMode, isTogglingMode } = useThemeStore()
   const { user, logout } = useAuthStore()
+
+  // Profile menu filtered by broker capabilities (shared hook, issue #1480)
+  const filteredProfileMenuItems = useProfileMenuItems()
 
   const handleLogout = async () => {
     try {
@@ -120,7 +126,7 @@ export function Navbar() {
                 <div className="px-3 py-2 text-xs font-medium text-muted-foreground uppercase tracking-wider">
                   Quick Access
                 </div>
-                {profileMenuItems.map((item) => (
+                {filteredProfileMenuItems.map((item) => (
                   <Link
                     key={item.href}
                     to={item.href}
@@ -157,12 +163,16 @@ export function Navbar() {
           <span className="hidden font-semibold sm:inline-block">OpenAlgo</span>
         </Link>
 
-        {/* Desktop Navigation */}
+        {/* Desktop Navigation.
+            Icon-only between md and xl so all 9 items fit portrait monitors
+            and small laptops (768-1280px wide) without squashing or pushing
+            the profile menu off-screen; full labels from xl up (issue #1384). */}
         <nav className="hidden md:flex items-center gap-1">
           {navItems.map((item) => (
             <Link
               key={item.href}
               to={item.href}
+              title={item.label}
               className={cn(
                 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors',
                 isActive(item.href)
@@ -170,16 +180,18 @@ export function Navbar() {
                   : 'text-muted-foreground hover:bg-muted hover:text-foreground'
               )}
             >
-              {item.label}
+              <item.icon className="h-4 w-4 shrink-0" />
+              <span className="hidden xl:inline">{item.label}</span>
             </Link>
           ))}
         </nav>
 
         {/* Right Side */}
         <div className="ml-auto flex items-center gap-1 sm:gap-2">
-          {/* Broker Badge */}
+          {/* Broker Badge — hidden below lg to keep the bar within narrow
+              (portrait/small-laptop) widths */}
           {user?.broker && (
-            <Badge variant="outline" className="hidden sm:flex text-xs">
+            <Badge variant="outline" className="hidden lg:flex text-xs">
               {user.broker}
             </Badge>
           )}
@@ -192,10 +204,10 @@ export function Navbar() {
               appMode === 'analyzer' && 'bg-purple-500 hover:bg-purple-600 text-white'
             )}
           >
-            <span className="hidden sm:inline">
+            <span className="hidden lg:inline">
               {appMode === 'live' ? 'Live Mode' : 'Analyze Mode'}
             </span>
-            <span className="sm:hidden">{appMode === 'live' ? 'Live' : 'Analyze'}</span>
+            <span className="lg:hidden">{appMode === 'live' ? 'Live' : 'Analyze'}</span>
           </Badge>
 
           {/* Mode Toggle */}
@@ -245,7 +257,7 @@ export function Navbar() {
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-56">
-              {profileMenuItems.map((item) => (
+              {filteredProfileMenuItems.map((item) => (
                 <DropdownMenuItem
                   key={item.href}
                   onSelect={() => navigate(item.href)}
@@ -268,7 +280,7 @@ export function Navbar() {
               </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem
-                onClick={handleLogout}
+                onClick={() => setShowLogoutDialog(true)}
                 className="text-destructive focus:text-destructive"
               >
                 <LogOut className="h-4 w-4 mr-2" />
@@ -278,6 +290,12 @@ export function Navbar() {
           </DropdownMenu>
         </div>
       </div>
+
+      <LogoutConfirmDialog
+        open={showLogoutDialog}
+        onOpenChange={setShowLogoutDialog}
+        onConfirm={handleLogout}
+      />
     </nav>
   )
 }

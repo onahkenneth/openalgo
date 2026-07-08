@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import struct
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -18,6 +19,21 @@ import websockets
 
 # Set up logging
 logger = logging.getLogger("dhan_websocket")
+
+# Issue #1344 (CRITICAL) — when running under gunicorn+eventlet (production
+# install path), eventlet monkey-patches threading.Thread into green threads.
+# asyncio.new_event_loop() inside a green thread is undefined behavior. The
+# in-house pattern in services/websocket_client.py:21-29 is to use
+# eventlet.patcher.original("threading") so the asyncio loop runs on a real
+# OS thread, bypassing the monkey-patch. The bug is invisible in dev (Flask
+# dev server uses standard threading) and only surfaces on production
+# gunicorn+eventlet deployments.
+if "eventlet" in sys.modules:
+    import eventlet
+
+    _original_threading = eventlet.patcher.original("threading")
+else:
+    _original_threading = threading
 
 
 class DhanWebSocket:
@@ -37,9 +53,11 @@ class DhanWebSocket:
     TYPE_DEPTH_20_BID = 41  # 20-level depth bid data
     TYPE_DEPTH_20_ASK = 51  # 20-level depth ask data
 
-    # WebSocket URL constants
-    MARKET_FEED_WSS = "wss://api-feed.dhan.co"
-    DEPTH_20_FEED_WSS = "wss://depth-api-feed.dhan.co/twentydepth"
+    # WebSocket URL constants (env-overridable)
+    MARKET_FEED_WSS = os.getenv("DHAN_MARKET_FEED_WSS", "wss://api-feed.dhan.co")
+    DEPTH_20_FEED_WSS = os.getenv(
+        "DHAN_DEPTH20_FEED_WSS", "wss://depth-api-feed.dhan.co/twentydepth"
+    )
 
     # Mode constants for V2 API
     MODE_LTP = "ltp"  # LTP only
@@ -53,8 +71,10 @@ class DhanWebSocket:
     REQUEST_CODE_FULL = TYPE_DEPTH  # 21 - Full market data (5-level depth)
     REQUEST_CODE_DEPTH_20 = 23  # 23 - 20-level market depth
 
-    # Heartbeat interval in seconds
-    HEARTBEAT_INTERVAL = 15
+    # Heartbeat interval in seconds. Aligned to ping_interval=30 (used in
+    # _connect) so we have a single liveness signal cadence rather than two
+    # on staggered schedules (issue #1344). Matches flattrade's pattern.
+    HEARTBEAT_INTERVAL = 30
 
     # Exchange code mapping for binary packets
     EXCHANGE_MAP = {
@@ -139,7 +159,12 @@ class DhanWebSocket:
 
         try:
             self.loop = asyncio.new_event_loop()
-            self.thread = threading.Thread(target=self._run_event_loop, daemon=True)
+            # Use _original_threading.Thread so the asyncio event loop runs
+            # on a real OS thread under gunicorn+eventlet — see issue #1344
+            # and the import-time setup at the top of this file.
+            self.thread = _original_threading.Thread(
+                target=self._run_event_loop, daemon=True
+            )
             self.thread.start()
             self.running = True
             logger.info("WebSocket client thread started")
@@ -231,7 +256,7 @@ class DhanWebSocket:
 
             # Build connection URL (Dhan V2 format)
             ws_url = f"{self.MARKET_FEED_WSS}?version=2&token={self.access_token}&clientId={self.client_id}&authType=2"
-            logger.info(f"Connecting to WebSocket URL: {ws_url[:50]}...")
+            logger.info("Connecting to WebSocket endpoint: %s", self.MARKET_FEED_WSS)
 
             self.ws = await websockets.connect(
                 ws_url, ping_interval=30, ping_timeout=10, close_timeout=10, max_size=None
@@ -413,10 +438,16 @@ class DhanWebSocket:
 
             logger.info("Starting reconnection process...")
 
-            # Reconnect with exponential backoff
+            # Reconnect with exponential backoff.
+            # Issue #1344: WS-layer retry capped at 1 to avoid the dual-retry
+            # storm with the adapter-layer (which has its own 10-attempt /
+            # 5s..300s exponential backoff). Adapter is the canonical retry
+            # owner; this layer just attempts a single immediate reconnect
+            # so transient network blips recover without involving the
+            # adapter, but persistent failures bubble up promptly.
             base_delay = 1.0  # Start with 1 second
             max_delay = 60.0  # Max 60 seconds between retries
-            max_attempts = 10  # Max number of retry attempts
+            max_attempts = 1  # Adapter layer owns the retry budget
 
             for attempt in range(1, max_attempts + 1):
                 if not self.running:
@@ -873,7 +904,7 @@ class DhanWebSocket:
                 """Converts EPOCH time to UTC time."""
                 try:
                     return datetime.fromtimestamp(epoch_time).strftime("%H:%M:%S")
-                except:
+                except Exception:
                     return datetime.now().strftime("%H:%M:%S")
 
             # Create tick format matching your expected output structure
@@ -1421,7 +1452,7 @@ class DhanWebSocket:
                 """Converts EPOCH time to UTC time."""
                 try:
                     return datetime.fromtimestamp(epoch_time).strftime("%H:%M:%S")
-                except:
+                except Exception:
                     return datetime.now().strftime("%H:%M:%S")
 
             # Create tick format matching your expected output structure
@@ -1792,9 +1823,11 @@ class DhanWebSocket:
 
             logger.info("🚀 Starting 20-level depth WebSocket connection...")
 
-            # Create new event loop for 20-level depth
+            # Create new event loop for 20-level depth (issue #1344 — use
+            # _original_threading.Thread so eventlet does not green-thread
+            # the asyncio loop's host).
             self.depth_20_loop = asyncio.new_event_loop()
-            self.depth_20_thread = threading.Thread(
+            self.depth_20_thread = _original_threading.Thread(
                 target=self._run_20_level_event_loop, daemon=True
             )
             self.depth_20_thread.start()
@@ -1918,7 +1951,7 @@ class DhanWebSocket:
         try:
             # Build connection URL - try without version parameter like in working example
             ws_url = f"{self.DEPTH_20_FEED_WSS}?token={self.access_token}&clientId={self.client_id}&authType=2"
-            logger.info(f"Connecting to 20-level depth endpoint: {ws_url[:50]}...")
+            logger.info("Connecting to 20-level depth endpoint: %s", self.DEPTH_20_FEED_WSS)
 
             # Connect using the same approach as the main WebSocket
             self.depth_20_ws = await websockets.connect(
@@ -2063,9 +2096,7 @@ class DhanWebSocket:
                 logger.error(f"msg_length parsed: {'msg_length' in locals()}")
                 logger.error(f"feed_code parsed: {'feed_code' in locals()}")
                 logger.error(f"token parsed: {'token' in locals()}")
-                import traceback
-
-                logger.error(f"Traceback: {traceback.format_exc()}")
+                logger.exception("Error in 20-level depth message parsing")
                 return
             except Exception as e:
                 logger.error(f"Error processing 20-level depth message: {e}", exc_info=True)
@@ -2480,10 +2511,10 @@ class DhanWebSocket:
             # Try different approaches to extract the token
             try:
                 security_id_int = struct.unpack("<I", header[4:8])[0]  # Little-endian
-            except:
+            except Exception:
                 try:
                     security_id_int = struct.unpack(">I", header[4:8])[0]  # Big-endian
-                except:
+                except Exception:
                     # Default to the passed token or RELIANCE
                     security_id_int = token or 2885
 
@@ -2615,9 +2646,7 @@ class DhanWebSocket:
             except Exception as parse_error:
                 logger.error(f"Error parsing bid packets: {parse_error}")
                 logger.error(f"Error type: {type(parse_error).__name__}")
-                import traceback
-
-                logger.error(f"Traceback: {traceback.format_exc()}")
+                logger.exception("Bid packet parsing traceback")
                 # Create empty depth data to avoid crashes
                 depth_data = []
 
@@ -2647,7 +2676,6 @@ class DhanWebSocket:
         except Exception as e:
             logger.error(f"Error handling 20-level bid data: {e}", exc_info=True)
             logger.error(f"Message hex: {message.hex()}")
-            logger.error(traceback.format_exc())
 
     def _handle_depth_20_ask(self, message, token=None):
         """Handle 20-level ask data (message type 51)"""
@@ -2670,10 +2698,10 @@ class DhanWebSocket:
             # Try different approaches to extract the token
             try:
                 security_id_int = struct.unpack("<I", header[4:8])[0]  # Little-endian
-            except:
+            except Exception:
                 try:
                     security_id_int = struct.unpack(">I", header[4:8])[0]  # Big-endian
-                except:
+                except Exception:
                     # Default to the passed token or RELIANCE
                     security_id_int = token or 2885
 
@@ -2781,9 +2809,7 @@ class DhanWebSocket:
             except Exception as parse_error:
                 logger.error(f"Error parsing ask packets: {parse_error}")
                 logger.error(f"Error type: {type(parse_error).__name__}")
-                import traceback
-
-                logger.error(f"Traceback: {traceback.format_exc()}")
+                logger.exception("Ask packet parsing traceback")
                 # Create empty depth data to avoid crashes
                 depth_data = []
 
@@ -2811,11 +2837,8 @@ class DhanWebSocket:
                 self._check_and_send_depth_20(token)
 
         except Exception as e:
-            logger.error(f"Error handling 20-level ask data: {e}")
+            logger.exception(f"Error handling 20-level ask data: {e}")
             logger.error(f"Message hex: {message.hex()}")
-            import traceback
-
-            logger.error(traceback.format_exc())
 
     def _check_and_send_depth_20(self, token):
         """Check if we have both bid and ask data and send combined tick"""

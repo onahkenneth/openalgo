@@ -10,6 +10,11 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+
+def _escape_like(term: str) -> str:
+    """Escape LIKE wildcard characters to prevent unintended broad matching."""
+    return term.replace("%", r"\%").replace("_", r"\_")
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 # Conditionally create engine based on DB type
 if DATABASE_URL and "sqlite" in DATABASE_URL:
@@ -39,6 +44,7 @@ class SymToken(Base):
     lotsize = Column(Integer)
     instrumenttype = Column(String)
     tick_size = Column(Float)
+    contract_value = Column(Float)
 
     # Composite indices for improved search performance
     __table_args__ = (
@@ -48,21 +54,33 @@ class SymToken(Base):
     )
 
 
-def enhanced_search_symbols(query: str, exchange: str = None) -> list[SymToken]:
+def enhanced_search_symbols(
+    query: str | None, exchange: str | None = None, limit: int | None = None
+) -> list[SymToken]:
     """
     Enhanced search function that searches across multiple fields
-    and supports partial matching with multiple terms
+    and supports partial matching with multiple terms.
+
+    If both query and exchange are empty, returns no results to avoid full-table scans.
+    If query is empty/None but exchange is provided, returns all rows for that exchange
+    (subject to limit) — useful for "show me everything in NSE" workflows.
 
     Args:
-        query (str): Search query string
-        exchange (str, optional): Exchange to filter by
+        query: Search query string (may be None/empty for exchange-only search)
+        exchange: Exchange to filter by
+        limit: Optional cap on number of results (None = no cap)
 
     Returns:
         List[SymToken]: List of matching SymToken objects
     """
     try:
         # Split the query into terms and clean them
-        terms = [term.strip().upper() for term in query.split() if term.strip()]
+        terms = [term.strip().upper() for term in (query or "").split() if term.strip()]
+
+        # Refuse to scan the full table without any filter — caller must scope by exchange
+        # if there is no query.
+        if not terms and not exchange:
+            return []
 
         # Base query
         base_query = SymToken.query
@@ -74,22 +92,23 @@ def enhanced_search_symbols(query: str, exchange: str = None) -> list[SymToken]:
         # Create conditions for each term
         all_conditions = []
         for term in terms:
+            safe_term = _escape_like(term)
             # Number detection for more accurate strike price and token searches
             try:
                 num_term = float(term)
                 term_conditions = or_(
-                    SymToken.symbol.ilike(f"%{term}%"),
-                    SymToken.brsymbol.ilike(f"%{term}%"),
-                    SymToken.name.ilike(f"%{term}%"),
-                    SymToken.token.ilike(f"%{term}%"),
+                    SymToken.symbol.ilike(f"%{safe_term}%", escape="\\"),
+                    SymToken.brsymbol.ilike(f"%{safe_term}%", escape="\\"),
+                    SymToken.name.ilike(f"%{safe_term}%", escape="\\"),
+                    SymToken.token.ilike(f"%{safe_term}%", escape="\\"),
                     SymToken.strike == num_term,
                 )
             except ValueError:
                 term_conditions = or_(
-                    SymToken.symbol.ilike(f"%{term}%"),
-                    SymToken.brsymbol.ilike(f"%{term}%"),
-                    SymToken.name.ilike(f"%{term}%"),
-                    SymToken.token.ilike(f"%{term}%"),
+                    SymToken.symbol.ilike(f"%{safe_term}%", escape="\\"),
+                    SymToken.brsymbol.ilike(f"%{safe_term}%", escape="\\"),
+                    SymToken.name.ilike(f"%{safe_term}%", escape="\\"),
+                    SymToken.token.ilike(f"%{safe_term}%", escape="\\"),
                 )
             all_conditions.append(term_conditions)
 
@@ -99,8 +118,11 @@ def enhanced_search_symbols(query: str, exchange: str = None) -> list[SymToken]:
         else:
             final_query = base_query
 
-        # Execute query - no limit to show all matching results
-        results = final_query.all()
+        # Execute query — apply limit if caller specified one
+        if limit is not None and limit > 0:
+            results = final_query.limit(limit).all()
+        else:
+            results = final_query.all()
         return results
 
     except Exception as e:
@@ -116,7 +138,7 @@ def fno_search_symbols_db(
     strike_min: float = None,
     strike_max: float = None,
     underlying: str = None,
-    limit: int = 500,
+    limit: int = 10000,
 ) -> list[dict]:
     """
     FNO-specific search function using direct database queries.
@@ -181,21 +203,22 @@ def fno_search_symbols_db(
             primary_term = terms[0] if terms else None
             all_conditions = []
             for term in terms:
+                safe_term = _escape_like(term)
                 try:
                     num_term = float(term)
                     term_conditions = or_(
-                        SymToken.symbol.ilike(f"%{term}%"),
-                        SymToken.brsymbol.ilike(f"%{term}%"),
-                        SymToken.name.ilike(f"%{term}%"),
-                        SymToken.token.ilike(f"%{term}%"),
+                        SymToken.symbol.ilike(f"%{safe_term}%", escape="\\"),
+                        SymToken.brsymbol.ilike(f"%{safe_term}%", escape="\\"),
+                        SymToken.name.ilike(f"%{safe_term}%", escape="\\"),
+                        SymToken.token.ilike(f"%{safe_term}%", escape="\\"),
                         SymToken.strike == num_term,
                     )
                 except ValueError:
                     term_conditions = or_(
-                        SymToken.symbol.ilike(f"%{term}%"),
-                        SymToken.brsymbol.ilike(f"%{term}%"),
-                        SymToken.name.ilike(f"%{term}%"),
-                        SymToken.token.ilike(f"%{term}%"),
+                        SymToken.symbol.ilike(f"%{safe_term}%", escape="\\"),
+                        SymToken.brsymbol.ilike(f"%{safe_term}%", escape="\\"),
+                        SymToken.name.ilike(f"%{safe_term}%", escape="\\"),
+                        SymToken.token.ilike(f"%{safe_term}%", escape="\\"),
                     )
                 all_conditions.append(term_conditions)
 
@@ -241,6 +264,7 @@ def fno_search_symbols_db(
         if primary_term:
 
             def sort_key(r):
+                """Sort results by relevance: exact match, prefix match, then alphabetical."""
                 name = r["name"] or ""
                 symbol = r["symbol"] or ""
                 # Priority 1: Exact match on name/underlying
@@ -294,6 +318,7 @@ def get_distinct_expiries(exchange: str = None, underlying: str = None) -> list[
 
         # Sort expiries chronologically
         def parse_expiry(exp_str):
+            """Parse an expiry date string into a datetime for chronological sorting."""
             try:
                 return datetime.strptime(exp_str, "%d-%b-%y")
             except ValueError:
@@ -342,7 +367,11 @@ def get_distinct_underlyings(exchange: str = None) -> list[str]:
 
 
 def init_db():
-    """Initialize the database"""
+    """Initialize the master contract database tables.
+
+    Creates the ``symtoken`` table if it does not already exist,
+    using the shared ``db_init_helper`` for consistent startup logging.
+    """
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(Base, engine, "Master Contract DB", logger)

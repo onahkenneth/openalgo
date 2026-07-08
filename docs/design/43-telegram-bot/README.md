@@ -51,19 +51,23 @@ OpenAlgo integrates with Telegram to provide real-time trading notifications, ac
 │  │  ┌──────────────────────────────────────────────────────────────┐  │   │
 │  │  │  Command Handler                                              │  │   │
 │  │  │                                                               │  │   │
-│  │  │  /start    - Initialize bot                                   │  │   │
-│  │  │  /help     - Show commands                                    │  │   │
-│  │  │  /funds    - Account balance                                  │  │   │
-│  │  │  /positions- Open positions                                   │  │   │
-│  │  │  /orders   - Order book                                       │  │   │
-│  │  │  /holdings - Portfolio holdings                               │  │   │
-│  │  │  /trades   - Trade book                                       │  │   │
-│  │  │  /pnl      - P&L summary                                      │  │   │
-│  │  │  /quote    - Get LTP                                          │  │   │
-│  │  │  /status   - Connection status                                │  │   │
-│  │  │  /alerts   - Toggle alerts                                    │  │   │
-│  │  │  /settings - Preferences                                      │  │   │
-│  │  │  /logout   - Disconnect                                       │  │   │
+│  │  │  /start      - Initialize bot                                 │  │   │
+│  │  │  /help       - Show commands                                  │  │   │
+│  │  │  /funds      - Account balance                                │  │   │
+│  │  │  /positions  - Open positions                                 │  │   │
+│  │  │  /orderbook  - Order book                                     │  │   │
+│  │  │  /holdings   - Portfolio holdings                             │  │   │
+│  │  │  /tradebook  - Trade book                                     │  │   │
+│  │  │  /pnl        - P&L summary                                    │  │   │
+│  │  │  /quote      - Get LTP                                        │  │   │
+│  │  │  /chart      - Render symbol chart                            │  │   │
+│  │  │  /status     - Connection status                              │  │   │
+│  │  │  /closeall   - Close all positions (with confirmation)        │  │   │
+│  │  │  /stoppython - Stop running Python strategies                 │  │   │
+│  │  │  /mode       - Toggle Live / Analyze mode                     │  │   │
+│  │  │  /menu       - Interactive menu                               │  │   │
+│  │  │  /link       - Link OpenAlgo account                          │  │   │
+│  │  │  /unlink     - Unlink account                                 │  │   │
 │  │  └──────────────────────────────────────────────────────────────┘  │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                    │                                         │
@@ -160,17 +164,39 @@ OpenAlgo integrates with Telegram to provide real-time trading notifications, ac
 |---------|-------------|---------|
 | /start | Initialize bot and link account | /start |
 | /help | Display available commands | /help |
+| /link `<api_key> <host_url>` | Link your OpenAlgo account | /link abc123 http://127.0.0.1:5000 |
+| /unlink | Unlink your account | /unlink |
+| /status | Check broker connection | /status |
 | /funds | Get account balance and margin | /funds |
 | /positions | View open positions with P&L | /positions |
-| /orders | Get today's order book | /orders |
+| /orderbook | Get today's order book | /orderbook |
+| /tradebook | Get executed trades | /tradebook |
 | /holdings | View portfolio holdings | /holdings |
-| /trades | Get executed trades | /trades |
 | /pnl | Get P&L summary | /pnl |
-| /quote SYMBOL | Get last traded price | /quote SBIN |
-| /status | Check broker connection | /status |
-| /alerts on/off | Toggle notifications | /alerts on |
-| /settings | View/modify preferences | /settings |
-| /logout | Disconnect bot | /logout |
+| /quote `<symbol> [exchange]` | Get last traded price | /quote SBIN |
+| /chart `<symbol> [exchange] [type] [interval] [days]` | Render chart image | /chart RELIANCE NSE intraday 15m 10 |
+| /closeall | Close all open positions (with confirmation, with optional "Close all + Stop strategies" action) | /closeall |
+| /stoppython | List and stop running Python strategies (single or all, with confirmation) | /stoppython |
+| /mode | View or toggle trading mode (Live / Analyze) | /mode |
+| /menu | Show interactive menu | /menu |
+
+#### `/closeall` — close all positions (and optionally stop strategies)
+
+Replies with an inline keyboard offering three choices:
+
+| Button | Action |
+|--------|--------|
+| ✅ Yes, close all | Calls `closeposition` via the SDK to flatten every open position. |
+| ⚠️ Close all + Stop strategies | Closes all positions, then iterates `RUNNING_STRATEGIES` and terminates each via `stop_strategy_process()`. Reports a combined summary (positions closed, strategies stopped, failures). |
+| ❌ Cancel | No-op. |
+
+#### `/stoppython` — stop running Python strategies
+
+Snapshots the live `RUNNING_STRATEGIES` registry from `blueprints/python_strategy.py` at the moment of invocation and renders one inline button per running strategy plus a "Stop All" button. Per-strategy and bulk actions both prompt for confirmation before terminating processes.
+
+The selection map is held in `context.user_data["stoppy_list"]` so the inline `callback_data` payload stays under Telegram's 64-byte cap regardless of how long strategy IDs are.
+
+If no strategies are running, the bot replies `ℹ️ No Python strategies running.` and exits cleanly.
 
 ## Configuration Flow
 
@@ -248,55 +274,56 @@ def handle_telegram_command(update):
         handlers = {
             '/start': handle_start,
             '/help': handle_help,
+            '/link': handle_link,
+            '/unlink': handle_unlink,
+            '/status': handle_status,
             '/funds': handle_funds,
             '/positions': handle_positions,
-            '/orders': handle_orders,
+            '/orderbook': handle_orderbook,
+            '/tradebook': handle_tradebook,
             '/holdings': handle_holdings,
-            '/trades': handle_trades,
             '/pnl': handle_pnl,
             '/quote': handle_quote,
-            '/status': handle_status,
-            '/alerts': handle_alerts,
-            '/settings': handle_settings,
-            '/logout': handle_logout
+            '/chart': handle_chart,
+            '/closeall': handle_closeall,           # confirmation + optional "stop strategies"
+            '/stoppython': handle_stoppython,       # list+stop running Python strategies
+            '/mode': handle_mode,
+            '/menu': handle_menu,
         }
 
         handler = handlers.get(command, handle_unknown)
         return handler(chat_id, args)
 ```
 
-### Notification Service
+### Order Alert Integration (via Event Bus)
+
+Order-related Telegram alerts are dispatched through the Event Bus. The `telegram_subscriber` receives all order events and calls `telegram_alert_service.send_order_alert()` for each one.
 
 ```python
-from concurrent.futures import ThreadPoolExecutor
-
-executor = ThreadPoolExecutor(max_workers=4)
-
-def send_notification_async(user_id, message_type, message):
-    """Send notification in background thread"""
-    executor.submit(_send_notification, user_id, message_type, message)
-
-def _send_notification(user_id, message_type, message):
-    """Send Telegram notification"""
-    # Get user's telegram config
-    config = get_bot_config(user_id)
-    telegram_user = get_telegram_user(user_id)
-
-    if not config or not telegram_user or not config.is_enabled:
-        return
-
-    # Check user preferences
-    prefs = get_user_preferences(user_id)
-    if message_type == 'order' and not prefs.order_alerts:
-        return
-
-    # Send via Telegram API
-    bot_token = decrypt_bot_token(config.bot_token)
-    send_telegram_message(bot_token, telegram_user.telegram_id, message)
-
-    # Log notification
-    log_notification(user_id, message_type, 'sent')
+# subscribers/telegram_subscriber.py
+def on_order_placed(event):
+    socketio.start_background_task(
+        telegram_alert_service.send_order_alert,
+        event.api_type, event.request_data, event.response_data, event.api_key,
+    )
 ```
+
+The alert service formats messages per order type and handles both live and analyze mode:
+
+| Order Type | Template |
+|------------|----------|
+| `placeorder` | Order Placed (symbol, action, qty, price) |
+| `placesmartorder` | Smart Order Placed (symbol, position_size) |
+| `basketorder` | Basket Order (success/fail counts, symbols) |
+| `splitorder` | Split Order (total qty, split size, success/fail) |
+| `optionsorder` | Options Order (underlying, legs, results) |
+| `optionsmultiorder` | Options Multi-Order (underlying, all legs with symbols) |
+| `modifyorder` | Order Modified (orderid, new qty/price) |
+| `cancelorder` | Order Cancelled (orderid) |
+| `cancelallorder` | All Orders Cancelled (counts) |
+| `closeposition` | Position Closed (symbol or count of positions) |
+
+See [53-event-bus](../53-event-bus/README.md) for the full event bus architecture.
 
 ## API Endpoints
 

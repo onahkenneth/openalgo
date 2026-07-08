@@ -37,10 +37,10 @@ if "%OPENALGO_DIR:~-1%"=="\" set OPENALGO_DIR=%OPENALGO_DIR:~0,-1%
 set SETUP_FAILED=0
 
 REM XTS Brokers that require market data credentials
-set XTS_BROKERS=fivepaisaxts,compositedge,ibulls,iifl,jainamxts,wisdom
+set XTS_BROKERS=fivepaisaxts,compositedge,ibulls,iifl,jainamxts,rmoney,wisdom
 
 REM Valid brokers list
-set VALID_BROKERS=fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha
+set VALID_BROKERS=fivepaisa,fivepaisaxts,aliceblue,angel,arrow,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,tradesmart,upstox,wisdom,zebu,zerodha
 
 REM Banner
 echo.
@@ -145,8 +145,8 @@ if errorlevel 1 (
 
 REM Update .env file with generated keys
 echo [INFO] Updating configuration with secure keys...
-powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace '3daa0403ce2501ee7432b75bf100048e3cf510d63d2754f952e93d88bf07ea84', '%APP_KEY%' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
-powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'a25d94718479b170c16278e321ea6c989358bf499a658fd20c90033cef8ce772', '%API_KEY_PEPPER%' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
+powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'OPENALGO_PLACEHOLDER_APP_KEY_REGENERATE_BEFORE_USE', '%APP_KEY%' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
+powershell -Command "(Get-Content '%OPENALGO_DIR%\%ENV_FILE%') -replace 'OPENALGO_PLACEHOLDER_API_KEY_PEPPER_REGENERATE_BEFORE_USE', '%API_KEY_PEPPER%' | Set-Content '%OPENALGO_DIR%\%ENV_FILE%'"
 echo [OK] Secure keys generated and saved.
 
 REM Get broker configuration
@@ -157,10 +157,10 @@ echo   ========================================
 echo.
 echo   Valid brokers:
 echo   fivepaisa, fivepaisaxts, aliceblue, angel, compositedge,
-echo   definedge, dhan, dhan_sandbox, firstock, flattrade, fyers,
-echo   groww, ibulls, iifl, indmoney, jainamxts, kotak, motilal,
-echo   mstock, nubra, paytm, pocketful, samco, shoonya, tradejini,
-echo   upstox, wisdom, zebu, zerodha
+echo   definedge, deltaexchange, dhan, dhan_sandbox, firstock, flattrade, fyers,
+echo   groww, ibulls, iifl, iiflcapital, indmoney, jainamxts, kotak, motilal,
+echo   mstock, nubra, paytm, pocketful, rmoney, samco, shoonya,
+echo   tradejini, tradesmart, upstox, wisdom, zebu, zerodha
 echo.
 
 :get_broker
@@ -381,7 +381,7 @@ docker run -d ^
     -v "%OPENALGO_DIR%\log:/app/log" ^
     -v "%OPENALGO_DIR%\keys:/app/keys" ^
     -v "%OPENALGO_DIR%\tmp:/app/tmp" ^
-    -v "%OPENALGO_DIR%\.env:/app/.env:ro" ^
+    -v "%OPENALGO_DIR%\.env:/app/.env" ^
     --restart unless-stopped ^
     %IMAGE%
 
@@ -508,7 +508,7 @@ echo   - Strategies: %OPENALGO_DIR%\strategies\
 echo   - Logs:       %OPENALGO_DIR%\log\
 echo.
 echo XTS Brokers (require market data credentials):
-echo   fivepaisaxts, compositedge, ibulls, iifl, jainamxts, wisdom
+echo   fivepaisaxts, compositedge, ibulls, iifl, jainamxts, rmoney, wisdom
 echo.
 goto end
 

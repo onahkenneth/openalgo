@@ -8,11 +8,12 @@ import shutil
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from database.auth_db import get_auth_token
+from database.engine_factory import create_db_engine
 from extensions import socketio  # Import SocketIO
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
@@ -72,7 +73,7 @@ data_types = {
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
 
-engine = create_engine(DATABASE_URL)
+engine = create_db_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -140,14 +141,14 @@ def download_csv_aliceblue_data(output_path):
     logger.info("Downloading Master Contract CSV Files")
     # URLs of the CSV files to be downloaded
     csv_urls = {
-        "CDS": "https://v2api.aliceblueonline.com/restpy/static/contract_master/CDS.csv",
-        "NFO": "https://v2api.aliceblueonline.com/restpy/static/contract_master/NFO.csv",
-        "NSE": "https://v2api.aliceblueonline.com/restpy/static/contract_master/NSE.csv",
-        "BSE": "https://v2api.aliceblueonline.com/restpy/static/contract_master/BSE.csv",
-        "BFO": "https://v2api.aliceblueonline.com/restpy/static/contract_master/BFO.csv",
-        "BCD": "https://v2api.aliceblueonline.com/restpy/static/contract_master/BCD.csv",
-        "MCX": "https://v2api.aliceblueonline.com/restpy/static/contract_master/MCX.csv",
-        "INDICES": "https://v2api.aliceblueonline.com/restpy/static/contract_master/INDICES.csv",
+        "CDS": "https://v2api.aliceblueonline.com/restpy/static/contract_master/V2/CDS.csv",
+        "NFO": "https://v2api.aliceblueonline.com/restpy/static/contract_master/V2/NFO.csv",
+        "NSE": "https://v2api.aliceblueonline.com/restpy/static/contract_master/V2/NSE.csv",
+        "BSE": "https://v2api.aliceblueonline.com/restpy/static/contract_master/V2/BSE.csv",
+        "BFO": "https://v2api.aliceblueonline.com/restpy/static/contract_master/V2/BFO.csv",
+        "BCD": "https://v2api.aliceblueonline.com/restpy/static/contract_master/V2/BCD.csv",
+        "MCX": "https://v2api.aliceblueonline.com/restpy/static/contract_master/V2/MCX.csv",
+        "INDICES": "https://v2api.aliceblueonline.com/restpy/static/contract_master/V2/INDICES.csv",
     }
 
     # Get the shared httpx client with connection pooling
@@ -275,6 +276,12 @@ def process_aliceblue_nfo_csv(path):
 
         return f"{row['Symbol']}{date_str}{Strike_price}"
 
+    # Futures rows in the NFO master carry Instrument Type 'FUTSTK'/'FUTIDX'
+    # with a NaN Option Type. Map them to 'XX' so the futures symbol logic
+    # below picks them up (mirrors the BFO/MCX processors).
+    df.loc[df["Instrument Type"] == "FUTSTK", "Option Type"] = "XX"
+    df.loc[df["Instrument Type"] == "FUTIDX", "Option Type"] = "XX"
+
     # Apply the function to rows where 'Option Type' is 'XX'
     df.loc[df["Option Type"] == "XX", "symbol"] = df["Trading Symbol"] + "UT"
 
@@ -338,6 +345,10 @@ def process_aliceblue_cds_csv(path):
             date_str = "NOEXP"  # Use a placeholder for missing dates
 
         return f"{row['Symbol']}{date_str}{Strike_price}"
+
+    # Currency futures carry Instrument Type 'FUTCUR' with a NaN Option Type.
+    # Map them to 'XX' so the futures symbol logic below picks them up.
+    df.loc[df["Instrument Type"] == "FUTCUR", "Option Type"] = "XX"
 
     # Apply the function to rows where 'Option Type' is 'XX'
     df.loc[df["Option Type"] == "XX", "symbol"] = df["Trading Symbol"] + "UT"
@@ -598,15 +609,49 @@ def process_aliceblue_indices_csv(path):
         {"NSE": "NSE_INDEX", "BSE": "BSE_INDEX", "MCX": "MCX_INDEX"}
     )
     token_df["tick_size"] = 0.01
+    # Step 1: Remove all spaces from symbol names (handles most NSE index mappings automatically)
+    token_df["symbol"] = token_df["symbol"].str.replace(" ", "", regex=False)
+
+    # Step 2: Apply only the special mappings that involve actual renaming (not just space removal)
     token_df["symbol"] = token_df["symbol"].replace(
         {
-            "NIFTY 50": "NIFTY",
-            "NIFTY NEXT 50": "NIFTYNXT50",
-            "NIFTY FIN SERVICE": "FINNIFTY",
-            "NIFTY BANK": "BANKNIFTY",
-            "NIFTY MIDCAP SELECT": "MIDCPNIFTY",
-            "INDIA VIX": "INDIAVIX",
+            # NSE Index Symbols requiring renaming (not just space removal)
+            "NIFTY50": "NIFTY",
+            "NIFTYNEXT50": "NIFTYNXT50",
+            "NIFTYFINSERVICE": "FINNIFTY",
+            "NIFTYBANK": "BANKNIFTY",
+            "NIFTYMIDCAPSELECT": "MIDCPNIFTY",
+            # BSE Index Symbols (AliceBlue -> OpenAlgo)
             "SNSX50": "SENSEX50",
+            "SNXT50": "BSESENSEXNEXT50",
+            "MID150": "BSE150MIDCAPINDEX",
+            "LMI250": "BSE250LARGEMIDCAPINDEX",
+            "MSL400": "BSE400MIDSMALLCAPINDEX",
+            "AUTO": "BSEAUTO",
+            "BSE CG": "BSECAPITALGOODS",
+            "CARBON": "BSECARBONEX",
+            "BSE CD": "BSECONSUMERDURABLES",
+            "CPSE": "BSECPSE",
+            "ENERGY": "BSEENERGY",
+            "BSEFMC": "BSEFASTMOVINGCONSUMERGOODS",
+            "FIN": "BSEFINANCIALSERVICES",
+            "GREENX": "BSEGREENEX",
+            "BSE HC": "BSEHEALTHCARE",
+            "INFRA": "BSEINDIAINFRASTRUCTUREINDEX",
+            "INDSTR": "BSEINDUSTRIALS",
+            "BSE IT": "BSEINFORMATIONTECHNOLOGY",
+            "LRGCAP": "BSELARGECAP",
+            "METAL": "BSEMETAL",
+            "MIDCAP": "BSEMIDCAP",
+            "MIDSEL": "BSEMIDCAPSELECTINDEX",
+            "OILGAS": "BSEOIL&GAS",
+            "POWER": "BSEPOWER",
+            "REALTY": "BSEREALTY",
+            "SMLCAP": "BSESMALLCAP",
+            "SMLSEL": "BSESMALLCAPSELECTINDEX",
+            "SMEIPO": "BSESMEIPO",
+            "TECK": "BSETECK",
+            "TELCOM": "BSETELECOM",
         }
     )
 

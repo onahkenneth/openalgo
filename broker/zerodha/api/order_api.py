@@ -1,6 +1,8 @@
 import http.client
 import json
 import os
+import threading
+import time
 import urllib.parse
 
 from broker.zerodha.mapping.transform_data import (
@@ -67,7 +69,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None):
             if hasattr(e, "response") and e.response is not None:
                 error_detail = e.response.json()
                 error_msg = error_detail.get("message", error_msg)
-        except:
+        except Exception:
             pass
 
         logger.exception(f"API request failed: {error_msg}")
@@ -90,11 +92,57 @@ def get_holdings(auth):
     return get_api_response("/portfolio/holdings", auth)
 
 
+# --- Per-Symbol Smart Order Lock ---
+# Ensures only one smart order per symbol executes at a time.
+# Others queue and execute sequentially, each getting a fresh position book.
+_symbol_locks = {}          # {symbol_key: threading.Lock}
+_symbol_locks_lock = threading.Lock()
+
+# --- Position Book Cache ---
+# Caches get_positions() for 1 second. Invalidated after each smart order placement.
+_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
+_position_cache_lock = threading.Lock()
+_POSITION_CACHE_TTL = 1.0   # seconds
+
+
+def _get_symbol_lock(symbol, exchange, product):
+    """Get or create a per-symbol lock for serializing smart orders."""
+    key = f"{symbol}:{exchange}:{product}"
+    with _symbol_locks_lock:
+        if key not in _symbol_locks:
+            _symbol_locks[key] = threading.Lock()
+        return _symbol_locks[key]
+
+
+def _get_cached_positions(auth):
+    """Get positions from cache if fresh, otherwise fetch from broker API."""
+    with _position_cache_lock:
+        now = time.monotonic()
+        cached = _position_cache.get(auth)
+        if cached and (now - cached["timestamp"]) < _POSITION_CACHE_TTL:
+            logger.debug("Position book served from cache")
+            return cached["data"]
+
+    # Cache miss or expired — fetch from broker
+    positions_data = get_positions(auth)
+
+    with _position_cache_lock:
+        _position_cache[auth] = {"data": positions_data, "timestamp": time.monotonic()}
+
+    return positions_data
+
+
+def _invalidate_position_cache(auth):
+    """Invalidate the position cache so the next queued order fetches fresh data."""
+    with _position_cache_lock:
+        _position_cache.pop(auth, None)
+
+
 def get_open_position(tradingsymbol, exchange, product, auth):
     # Convert Trading Symbol from OpenAlgo Format to Broker Format Before Search in OpenPosition
     tradingsymbol = get_br_symbol(tradingsymbol, exchange)
 
-    positions_data = get_positions(auth)
+    positions_data = _get_cached_positions(auth)
     net_qty = "0"
 
     if positions_data and positions_data.get("status") and positions_data.get("data"):
@@ -105,7 +153,7 @@ def get_open_position(tradingsymbol, exchange, product, auth):
                 and position.get("product") == product
             ):
                 net_qty = position.get("quantity", "0")
-                logger.info(f"Net Quantity {net_qty}")
+                logger.debug(f"Net Quantity {net_qty}")
                 break  # Assuming you need the first match
 
     return net_qty
@@ -131,13 +179,15 @@ def place_order_api(data, auth):
         "trigger_price": newdata["trigger_price"],
         "disclosed_quantity": newdata["disclosed_quantity"],
         "validity": newdata["validity"],
+        "market_protection": newdata["market_protection"],
         "tag": newdata["tag"],
     }
 
-    logger.info(f"Payload for place_order_api: {payload}")
+    logger.debug(f"Payload for place_order_api: {payload}")
 
     # URL-encode the payload
     payload_encoded = urllib.parse.urlencode(payload)
+    logger.debug(f"Encoded payload to Zerodha: {payload_encoded}")
 
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
@@ -153,9 +203,12 @@ def place_order_api(data, auth):
         "https://api.kite.trade/orders/regular", headers=headers, content=payload_encoded
     )
 
+    # Log raw response
+    logger.debug(f"Zerodha raw response: status={response.status_code}, body={response.text}")
+
     # Parse the response
     response_data = response.json()
-    logger.info(f"Response from place_order_api: {response_data}")
+    logger.debug(f"Response from place_order_api: {response_data}")
 
     # Handle the response
     if response_data["status"] == "success":
@@ -185,53 +238,66 @@ def place_smartorder_api(data, auth):
         product = data.get("product")
 
         if not all([symbol, exchange, product]):
-            logger.info("Missing required parameters in place_smartorder_api")
+            logger.debug("Missing required parameters in place_smartorder_api")
             return res, response_data, orderid
 
-        position_size = int(data.get("position_size", "0"))
+        # Per-symbol lock: only one smart order per symbol executes at a time.
+        # Queued orders wait, then get fresh position data after cache invalidation.
+        symbol_lock = _get_symbol_lock(symbol, exchange, product)
 
-        # Get current open position for the symbol
-        current_position = int(
-            get_open_position(symbol, exchange, map_product_type(product), AUTH_TOKEN)
-        )
+        with symbol_lock:
+            position_size = int(data.get("position_size", "0"))
 
-        logger.info(f"position_size: {position_size}")
-        logger.info(f"Open Position: {current_position}")
+            # Get current open position for the symbol
+            current_position = int(
+                get_open_position(symbol, exchange, map_product_type(product), AUTH_TOKEN)
+            )
 
-        # Determine action based on position_size and current_position
-        action = None
-        quantity = 0
+            logger.debug(f"position_size: {position_size}")
+            logger.debug(f"Open Position: {current_position}")
 
-        if position_size == 0 and current_position > 0:
-            action = "SELL"
-            quantity = abs(current_position)
-        elif position_size == 0 and current_position < 0:
-            action = "BUY"
-            quantity = abs(current_position)
-        elif current_position == 0:
-            action = "BUY" if position_size > 0 else "SELL"
-            quantity = abs(position_size)
-        else:
-            if position_size > current_position:
-                action = "BUY"
-                quantity = position_size - current_position
-            elif position_size < current_position:
+            # Determine action based on position_size and current_position
+            action = None
+            quantity = 0
+
+            if position_size == 0 and current_position == 0:
+                # No position exists, no target position — use action and qty from request
+                action = data.get("action", "BUY").upper()
+                quantity = int(data.get("quantity", "0"))
+            elif position_size == 0 and current_position > 0:
                 action = "SELL"
-                quantity = current_position - position_size
+                quantity = abs(current_position)
+            elif position_size == 0 and current_position < 0:
+                action = "BUY"
+                quantity = abs(current_position)
+            elif current_position == 0:
+                action = "BUY" if position_size > 0 else "SELL"
+                quantity = abs(position_size)
+            else:
+                if position_size > current_position:
+                    action = "BUY"
+                    quantity = position_size - current_position
+                elif position_size < current_position:
+                    action = "SELL"
+                    quantity = current_position - position_size
 
-        if action and quantity > 0:
-            # Prepare data for placing the order
-            order_data = data.copy()
-            order_data["action"] = action
-            order_data["quantity"] = str(quantity)
+            if action and quantity > 0:
+                # Prepare data for placing the order
+                order_data = data.copy()
+                order_data["action"] = action
+                order_data["quantity"] = str(quantity)
 
-            # Place the order
-            res, response, orderid = place_order_api(order_data, AUTH_TOKEN)
-            return res, response, orderid
-        else:
-            logger.info("No action required or invalid quantity")
-            response_data = {"status": "success", "message": "No action required"}
-            return res, response_data, orderid
+                # Place the order
+                res, response, orderid = place_order_api(order_data, AUTH_TOKEN)
+
+                # Invalidate cache so next queued order gets fresh position data
+                _invalidate_position_cache(AUTH_TOKEN)
+
+                return res, response, orderid
+            else:
+                logger.debug("No action required or invalid quantity")
+                response_data = {"status": "success", "message": "No action needed. Position already matched."}
+                return res, response_data, orderid
 
     except Exception as e:
         error_msg = f"Error in place_smartorder_api: {e}"
@@ -277,12 +343,12 @@ def close_all_positions(current_api_key, auth):
                 "quantity": str(quantity),
             }
 
-            logger.info(f"Close position payload: {place_order_payload}")
+            logger.debug(f"Close position payload: {place_order_payload}")
 
             # Place the order to close the position
             _, api_response, _ = place_order_api(place_order_payload, AUTH_TOKEN)
 
-            logger.info(f"Close position response: {api_response}")
+            logger.debug(f"Close position response: {api_response}")
 
             # Note: Ensure place_order_api handles any errors and logs accordingly
 
@@ -316,7 +382,7 @@ def cancel_order(orderid, auth):
 
         response.raise_for_status()
         data = response.json()
-        logger.info(f"Cancel order response: {data}")
+        logger.debug(f"Cancel order response: {data}")
 
         # Check if the request was successful
         if data.get("status"):
@@ -353,7 +419,7 @@ def modify_order(data, auth):
     if newdata.get("trigger_price"):
         payload["trigger_price"] = str(newdata["trigger_price"])
 
-    logger.info(f"Modify order payload: {payload}")
+    logger.debug(f"Modify order payload: {payload}")
 
     # URL-encode the payload
     payload_encoded = urllib.parse.urlencode(payload)
@@ -376,7 +442,7 @@ def modify_order(data, auth):
 
     # Parse the response
     response_data = response.json()
-    logger.info(f"Modify order response: {response_data}")
+    logger.debug(f"Modify order response: {response_data}")
 
     # Add status attribute to maintain backward compatibility
     response.status = response.status_code
@@ -403,7 +469,7 @@ def cancel_all_orders_api(data, auth):
         for order in order_book_response.get("data", [])
         if order["status"] in ["OPEN", "TRIGGER PENDING"]
     ]
-    logger.info(f"{orders_to_cancel}")
+    logger.debug(f"{orders_to_cancel}")
     canceled_orders = []
     failed_cancellations = []
 

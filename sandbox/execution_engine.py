@@ -25,6 +25,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database.auth_db import get_auth_token_broker
 from database.sandbox_db import SandboxOrders, SandboxPositions, SandboxTrades, db_session
+from database.token_db import get_symbol_info
 from sandbox.fund_manager import FundManager, reconcile_margin, validate_margin_consistency
 from services.quotes_service import get_multiquotes, get_quotes
 from utils.logging import get_logger
@@ -204,6 +205,42 @@ class ExecutionEngine:
 
         return quote_cache
 
+    def _publish_fill_event(
+        self, orderid, tradeid, symbol, exchange, action, quantity, price, product, strategy
+    ):
+        """Emit SandboxOrderFilledEvent so the analyzer-mode UI auto-refreshes.
+
+        Logged at INFO so it's visible in server logs and confirms the
+        event-bus path was reached (any breakage in registration or imports
+        would suppress the log too).
+        """
+        try:
+            from events import SandboxOrderFilledEvent
+            from utils.event_bus import bus
+
+            bus.publish(
+                SandboxOrderFilledEvent(
+                    mode="analyze",
+                    api_type="sandbox.fill",
+                    orderid=orderid,
+                    tradeid=tradeid,
+                    symbol=symbol,
+                    exchange=exchange,
+                    action=action,
+                    quantity=quantity,
+                    price=price,
+                    product=product,
+                    strategy=strategy,
+                )
+            )
+            logger.info(
+                f"[sandbox-fill] Published SandboxOrderFilledEvent for {orderid} "
+                f"({symbol} {action} {quantity} @ {price})"
+            )
+        except Exception as pub_err:
+            # Never let event-bus failures break order execution
+            logger.debug(f"Failed to publish SandboxOrderFilledEvent: {pub_err}")
+
     def _process_order(self, order, quote):
         """
         Process a single order based on current quote
@@ -228,6 +265,19 @@ class ExecutionEngine:
                     db_session.commit()
                     logger.info(
                         f"Updated order {order.orderid} status to complete (was in race condition)"
+                    )
+                    # Race-condition cleanup transitions an order to complete
+                    # without going through _execute_order, so emit here too.
+                    self._publish_fill_event(
+                        orderid=order.orderid,
+                        tradeid=existing_trade.tradeid,
+                        symbol=order.symbol,
+                        exchange=order.exchange,
+                        action=order.action,
+                        quantity=int(order.quantity),
+                        price=float(existing_trade.price),
+                        product=order.product,
+                        strategy=order.strategy or "",
                     )
                 return
 
@@ -340,6 +390,22 @@ class ExecutionEngine:
 
             logger.info(f"Order {order.orderid} executed successfully. Trade ID: {tradeid}")
 
+            # Notify UI subscribers (OrderBook / TradeBook / Positions auto-refresh).
+            # Engine-internal fills don't go through the service layer, so the
+            # service-layer publish points (place_order_service etc.) never see
+            # them — without this the analyzer UI sits stale until manual refresh.
+            self._publish_fill_event(
+                orderid=order.orderid,
+                tradeid=tradeid,
+                symbol=order.symbol,
+                exchange=order.exchange,
+                action=order.action,
+                quantity=int(order.quantity),
+                price=float(execution_price),
+                product=order.product,
+                strategy=order.strategy or "",
+            )
+
         except Exception as e:
             db_session.rollback()
             logger.exception(f"Error executing order {order.orderid}: {e}")
@@ -350,7 +416,7 @@ class ExecutionEngine:
                 order.rejection_reason = f"Execution error: {str(e)}"
                 order.update_timestamp = datetime.now(pytz.timezone("Asia/Kolkata"))
                 db_session.commit()
-            except:
+            except Exception:
                 db_session.rollback()
 
     def _update_position(self, order, execution_price):
@@ -430,8 +496,10 @@ class ExecutionEngine:
                 elif final_quantity == 0:
                     # Position closed completely
                     # Calculate realized P&L
+                    _sym_cv_info = get_symbol_info(order.symbol, order.exchange)
+                    _cv = float(_sym_cv_info.contract_value) if _sym_cv_info and _sym_cv_info.contract_value else 1.0
                     realized_pnl = self._calculate_realized_pnl(
-                        old_quantity, position.average_price, abs(new_quantity), execution_price
+                        old_quantity, position.average_price, abs(new_quantity), execution_price, contract_value=_cv
                     )
 
                     # Release the EXACT margin that was stored in the position
@@ -506,8 +574,10 @@ class ExecutionEngine:
                     reduced_quantity = min(abs(old_quantity), abs(new_quantity))
 
                     # Calculate realized P&L for reduced portion
+                    _sym_cv_info = get_symbol_info(order.symbol, order.exchange)
+                    _cv = float(_sym_cv_info.contract_value) if _sym_cv_info and _sym_cv_info.contract_value else 1.0
                     realized_pnl = self._calculate_realized_pnl(
-                        old_quantity, position.average_price, reduced_quantity, execution_price
+                        old_quantity, position.average_price, reduced_quantity, execution_price, contract_value=_cv
                     )
 
                     # Add realized P&L to accumulated realized P&L (all-time)
@@ -607,19 +677,20 @@ class ExecutionEngine:
             logger.exception(f"Error updating position for order {order.orderid}: {e}")
             raise
 
-    def _calculate_realized_pnl(self, old_quantity, avg_price, close_quantity, close_price):
-        """Calculate realized P&L for closed positions"""
+    def _calculate_realized_pnl(self, old_quantity, avg_price, close_quantity, close_price, contract_value=1.0):
+        """Calculate realized P&L for closed positions, multiplied by contract_value (e.g. 0.01 for ETHUSD.P)."""
         try:
             avg_price = Decimal(str(avg_price))
             close_price = Decimal(str(close_price))
             close_quantity = Decimal(str(close_quantity))
+            cv = Decimal(str(contract_value))
 
             if old_quantity > 0:
                 # Long position closed
-                pnl = (close_price - avg_price) * close_quantity
+                pnl = (close_price - avg_price) * close_quantity * cv
             else:
                 # Short position closed
-                pnl = (avg_price - close_price) * close_quantity
+                pnl = (avg_price - close_price) * close_quantity * cv
 
             return pnl
 

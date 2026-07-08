@@ -17,7 +17,12 @@ logger = logging.getLogger(__name__)
 class DefinedGeWebSocket:
     """DefinedGe Securities WebSocket client for real-time data streaming"""
 
-    def __init__(self, auth_data):
+    def __init__(self, auth_data, token_provider=None):
+        # Optional callable that returns a fresh auth_data dict from the DB.
+        # Used to refresh susertoken/api_session_key before each reconnect,
+        # since DefinEdge (Noren) tokens roll over daily at ~3 AM IST.
+        self.token_provider = token_provider
+
         # Accept auth_data as dict (following Angel pattern)
         if isinstance(auth_data, dict):
             # Extract from dictionary
@@ -82,6 +87,37 @@ class DefinedGeWebSocket:
         self.heartbeat_interval = 50  # 50 seconds as per API docs
         self.heartbeat_running = False
 
+    def _refresh_tokens(self):
+        """Re-read fresh auth tokens from the DB via token_provider.
+
+        Updates susertoken and api_session_key in place so a reconnect uses
+        the current day's token. On failure the existing tokens are kept.
+        """
+        if not self.token_provider:
+            return
+        try:
+            fresh = self.token_provider()
+            if not fresh or not isinstance(fresh, dict):
+                logger.warning(
+                    "Could not fetch fresh tokens on reconnect; using existing tokens"
+                )
+                return
+
+            auth_token = fresh.get("auth_token", "")
+            susertoken = fresh.get("feed_token", "")
+
+            if susertoken:
+                self.susertoken = susertoken
+            if auth_token:
+                if ":::" in auth_token:
+                    parts = auth_token.split(":::")
+                    self.api_session_key = parts[0] if len(parts) > 0 else ""
+                else:
+                    self.api_session_key = auth_token
+            logger.info("Refreshed DefinedGe auth tokens before reconnect")
+        except Exception as e:
+            logger.error(f"Error refreshing tokens before reconnect: {e}")
+
     def connect(self, ssl_verify=True):
         """Connect to DefinedGe WebSocket"""
         try:
@@ -111,6 +147,9 @@ class DefinedGeWebSocket:
                 time.sleep(0.1)
 
             if not self.connected:
+                # Clean up the orphaned socket/thread on timeout
+                if self.ws:
+                    self.ws.close()
                 raise Exception("WebSocket connection timeout")
 
             logger.info("DefinedGe WebSocket connected successfully")
@@ -179,8 +218,15 @@ class DefinedGeWebSocket:
         if self.should_reconnect and self.reconnect_attempts < self.max_reconnect_attempts:
             self.reconnect_attempts += 1
             logger.info(f"Attempting to reconnect... (attempt {self.reconnect_attempts})")
-            time.sleep(self.reconnect_delay)
-            self.connect()
+
+            def delayed_reconnect():
+                time.sleep(self.reconnect_delay)
+                if self.should_reconnect:
+                    # Re-read fresh token from DB before reconnecting
+                    self._refresh_tokens()
+                    self.connect()
+
+            threading.Thread(target=delayed_reconnect, daemon=True).start()
         elif not self.should_reconnect:
             logger.info("Auto-reconnect disabled - not attempting reconnection")
 
@@ -287,34 +333,8 @@ class DefinedGeWebSocket:
         token = data.get("tk")
         exchange = data.get("e")
 
-        # Check all fields in the message
-        logger.info(f"=== TICK DATA RECEIVED for {exchange}|{token} ===")
-        logger.info(f"All fields in message: {list(data.keys())}")
-
-        # Specifically check for OHLC fields
-        ohlc_check = {
-            "o (open)": data.get("o"),
-            "h (high)": data.get("h"),
-            "l (low)": data.get("l"),
-            "c (close)": data.get("c"),
-            "lp (ltp)": data.get("lp"),
-            "v (volume)": data.get("v"),
-        }
-
-        logger.info(f"OHLC field values: {ohlc_check}")
-
-        # Check if any OHLC values are present and non-zero
-        has_ohlc = any(data.get(field) not in [None, "", "0", 0] for field in ["o", "h", "l", "c"])
-
-        if has_ohlc:
-            logger.info(f"✓ OHLC DATA PRESENT for {exchange}|{token}")
-        else:
-            logger.warning(
-                f"✗ NO OHLC DATA for {exchange}|{token} - Broker not sending OHLC in touchline feed"
-            )
-
-        # Log the complete raw message for debugging
-        logger.debug(f"Full raw message: {data}")
+        # Log tick data at debug level to avoid flooding logs
+        logger.debug(f"Tick data for {exchange}|{token}: lp={data.get('lp')}, fields={list(data.keys())}")
 
         if self.on_tick:
             try:
@@ -347,25 +367,9 @@ class DefinedGeWebSocket:
         token = data.get("tk")
         exchange = data.get("e")
 
-        logger.info(f"=== TOUCHLINE ACK for {exchange}|{token} ===")
-        logger.info(f"All fields in acknowledgment: {list(data.keys())}")
-
-        # Log raw acknowledgment for debugging
-        logger.info(f"Raw ACK data: {json.dumps(data, indent=2)}")
-
-        # Check what initial data we're getting
-        initial_data = {
-            "o (open)": data.get("o"),
-            "h (high)": data.get("h"),
-            "l (low)": data.get("l"),
-            "c (close)": data.get("c"),
-            "lp (ltp)": data.get("lp"),
-            "v (volume)": data.get("v"),
-            "pc (% change)": data.get("pc"),
-            "ap (avg price)": data.get("ap"),
-        }
-
-        logger.info(f"Initial data in ACK: {initial_data}")
+        logger.info(f"Touchline subscription acknowledged: {exchange}|{token}")
+        logger.debug(f"ACK fields: {list(data.keys())}")
+        logger.debug(f"Raw ACK data: {json.dumps(data, indent=2)}")
 
         # Check if OHLC is provided in acknowledgment
         has_ohlc_in_ack = any(
@@ -373,7 +377,7 @@ class DefinedGeWebSocket:
         )
 
         if has_ohlc_in_ack:
-            logger.info(f"✅ OHLC provided in subscription ACK for {exchange}|{token}")
+            logger.debug(f"OHLC provided in ACK for {exchange}|{token}")
         else:
             # Check current time to see if market is open
             import datetime
@@ -384,10 +388,10 @@ class DefinedGeWebSocket:
 
             if now < market_open or now > market_close:
                 logger.warning(
-                    f"⏰ Market closed - No OHLC expected (Current: {now.strftime('%H:%M')})"
+                    f"Market closed - No OHLC expected (Current: {now.strftime('%H:%M')})"
                 )
             else:
-                logger.warning(f"⚠️ Market open but NO OHLC in ACK for {exchange}|{token}")
+                logger.warning(f"Market open but NO OHLC in ACK for {exchange}|{token}")
 
         logger.debug(f"Full ACK message: {data}")
 

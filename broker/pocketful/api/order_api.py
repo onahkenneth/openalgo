@@ -1,6 +1,8 @@
 import json
 
 from flask import session
+import threading
+import time
 
 from broker.pocketful.mapping.transform_data import (
     map_product_type,
@@ -47,7 +49,7 @@ def get_api_response(endpoint, auth_token, method="GET", payload=None):
     if payload:
         logger.debug(f"DEBUG - Payload: {json.dumps(payload, indent=2)}")
         if "oms_order_id" in payload:
-            logger.info(f"DEBUG - Order ID in payload: {payload['oms_order_id']}")
+            logger.debug(f"DEBUG - Order ID in payload: {payload['oms_order_id']}")
 
     try:
         if method == "GET":
@@ -108,13 +110,13 @@ def get_order_book(auth):
     # Fetch completed orders
     completed_orders = fetch_orders(auth, client_id, "completed")
     if completed_orders.get("status") == "error":
-        logger.info(f"DEBUG - Error fetching completed orders: {completed_orders.get('message')}")
+        logger.debug(f"DEBUG - Error fetching completed orders: {completed_orders.get('message')}")
         completed_orders = {"data": {"orders": []}}
 
     # Fetch pending orders
     pending_orders = fetch_orders(auth, client_id, "pending")
     if pending_orders.get("status") == "error":
-        logger.info(f"DEBUG - Error fetching pending orders: {pending_orders.get('message')}")
+        logger.debug(f"DEBUG - Error fetching pending orders: {pending_orders.get('message')}")
         pending_orders = {"data": {"orders": []}}
 
     # Combine the orders
@@ -416,7 +418,7 @@ def get_holdings(auth):
 
     # Check if there was an error in the API response
     if holdings_response.get("status") == "error":
-        logger.info(f"DEBUG - Error fetching holdings: {holdings_response.get('message')}")
+        logger.debug(f"DEBUG - Error fetching holdings: {holdings_response.get('message')}")
         return holdings_response
 
     # Transform the holdings data into the standard format
@@ -424,7 +426,7 @@ def get_holdings(auth):
 
     # Print debug information about the response
     logger.debug(f"DEBUG - Holdings response type: {type(holdings_response)}")
-    logger.info(
+    logger.debug(
         f"DEBUG - Holdings response keys: {holdings_response.keys() if isinstance(holdings_response, dict) else 'Not a dictionary'}"
     )
 
@@ -504,6 +506,51 @@ def get_holdings(auth):
     return {"status": "success", "data": transformed_holdings}
 
 
+# --- Per-Symbol Smart Order Lock ---
+# Ensures only one smart order per symbol executes at a time.
+# Others queue and execute sequentially, each getting a fresh position book.
+_symbol_locks = {}          # {symbol_key: threading.Lock}
+_symbol_locks_lock = threading.Lock()
+
+# --- Position Book Cache ---
+# Caches get_positions() for 1 second. Invalidated after each smart order placement.
+_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
+_position_cache_lock = threading.Lock()
+_POSITION_CACHE_TTL = 1.0   # seconds
+
+
+def _get_symbol_lock(symbol, exchange, product):
+    """Get or create a per-symbol lock for serializing smart orders."""
+    key = f"{symbol}:{exchange}:{product}"
+    with _symbol_locks_lock:
+        if key not in _symbol_locks:
+            _symbol_locks[key] = threading.Lock()
+        return _symbol_locks[key]
+
+
+def _get_cached_positions(auth):
+    """Get positions from cache if fresh, otherwise fetch from broker API."""
+    with _position_cache_lock:
+        now = time.monotonic()
+        cached = _position_cache.get(auth)
+        if cached and (now - cached["timestamp"]) < _POSITION_CACHE_TTL:
+            return cached["data"]
+
+    # Cache miss or expired - fetch from broker
+    positions_data = get_positions(auth)
+
+    with _position_cache_lock:
+        _position_cache[auth] = {"data": positions_data, "timestamp": time.monotonic()}
+
+    return positions_data
+
+
+def _invalidate_position_cache(auth):
+    """Invalidate the position cache so the next queued order fetches fresh data."""
+    with _position_cache_lock:
+        _position_cache.pop(auth, None)
+
+
 def get_open_position(tradingsymbol, exchange, product, auth):
     """
     Get open position quantity for a specific instrument.
@@ -528,7 +575,7 @@ def get_open_position(tradingsymbol, exchange, product, auth):
     )
 
     # Get positions data
-    positions_data = get_positions(auth)
+    positions_data = _get_cached_positions(auth)
 
     # Check if positions data is available and contains positions
     if positions_data and positions_data.get("status") == "success" and positions_data.get("data"):
@@ -591,10 +638,10 @@ def place_order_api(data, auth_token):
                 return None, {"status": "error", "message": "Client ID not found"}, None
         else:
             return None, info_response, None
-    logger.info(f"Client ID: {client_id}")
+    logger.debug(f"Client ID: {client_id}")
     # Transform OpenAlgo order format to Pocketful format
     newdata = transform_data(data, client_id=client_id)
-    logger.info(f"Transformed data: {newdata}")
+    logger.debug(f"Transformed data: {newdata}")
     # Make the API request
     response_data = get_api_response(ORDER_ENDPOINT, auth_token, method="POST", payload=newdata)
 
@@ -624,52 +671,73 @@ def place_smartorder_api(data, auth):
     symbol = data.get("symbol")
     exchange = data.get("exchange")
     product = data.get("product")
-    position_size = int(data.get("position_size", "0"))
+    # Per-symbol lock: serialize smart orders per symbol
+    symbol_lock = _get_symbol_lock(symbol, exchange, product)
 
-    # Get current open position for the symbol
-    current_position = int(
-        get_open_position(symbol, exchange, map_product_type(product), AUTH_TOKEN)
-    )
+    with symbol_lock:
+        position_size = int(data.get("position_size", "0"))
 
-    logger.info(f"position_size : {position_size}")
-    logger.info(f"Open Position : {current_position}")
+        # Get current open position for the symbol
+        current_position = int(
+            get_open_position(symbol, exchange, map_product_type(product), AUTH_TOKEN)
+        )
 
-    # Determine action based on position_size and current_position
-    action = None
-    quantity = 0
+        logger.debug(f"position_size : {position_size}")
+        logger.debug(f"Open Position : {current_position}")
 
-    if position_size == 0 and current_position > 0:
-        action = "SELL"
-        quantity = abs(current_position)
-    elif position_size == 0 and current_position < 0:
-        action = "BUY"
-        quantity = abs(current_position)
-    elif current_position == 0:
-        action = "BUY" if position_size > 0 else "SELL"
-        quantity = abs(position_size)
-    else:
-        if position_size > current_position:
-            action = "BUY"
-            quantity = position_size - current_position
-            # logger.info(f"smart buy quantity : {quantity}")
-        elif position_size < current_position:
+        # Determine action based on position_size and current_position
+        action = None
+        quantity = 0
+
+        # If both position_size and current_position are 0, use action+qty from request
+        if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
+            action = data["action"]
+            quantity = data["quantity"]
+            res, response, orderid = place_order_api(data, AUTH_TOKEN)
+            _invalidate_position_cache(AUTH_TOKEN)
+            return res, response, orderid
+
+        elif position_size == current_position:
+            if int(data["quantity"]) == 0:
+                response = {"status": "success", "message": "No OpenPosition Found. Not placing Exit order."}
+            else:
+                response = {"status": "success", "message": "No action needed. Position size matches current position"}
+            orderid = None
+            return res, response, orderid
+
+        if position_size == 0 and current_position > 0:
             action = "SELL"
-            quantity = current_position - position_size
-            # logger.info(f"smart sell quantity : {quantity}")
+            quantity = abs(current_position)
+        elif position_size == 0 and current_position < 0:
+            action = "BUY"
+            quantity = abs(current_position)
+        elif current_position == 0:
+            action = "BUY" if position_size > 0 else "SELL"
+            quantity = abs(position_size)
+        else:
+            if position_size > current_position:
+                action = "BUY"
+                quantity = position_size - current_position
+                # logger.debug(f"smart buy quantity : {quantity}")
+            elif position_size < current_position:
+                action = "SELL"
+                quantity = current_position - position_size
+                # logger.debug(f"smart sell quantity : {quantity}")
 
-    if action:
-        # Prepare data for placing the order
-        order_data = data.copy()
-        order_data["action"] = action
-        order_data["quantity"] = str(quantity)
+        if action:
+            # Prepare data for placing the order
+            order_data = data.copy()
+            order_data["action"] = action
+            order_data["quantity"] = str(quantity)
 
-        # logger.info(f"{order_data}")
-        # Place the order
-        res, response, orderid = place_order_api(order_data, AUTH_TOKEN)
-        # logger.info(f"{res}")
-        # logger.info(f"{response}")
+            # logger.debug(f"{order_data}")
+            # Place the order
+            res, response, orderid = place_order_api(order_data, AUTH_TOKEN)
+            _invalidate_position_cache(AUTH_TOKEN)
+            # logger.debug(f"{res}")
+            # logger.debug(f"{response}")
 
-        return res, response, orderid
+            return res, response, orderid
 
 
 def close_all_positions(current_api_key, auth):
@@ -714,7 +782,7 @@ def close_all_positions(current_api_key, auth):
 
         # Parse JSON response
         response_data = response.json()
-        logger.info(f"DEBUG - Response status: {response_data.get('status')}")
+        logger.debug(f"DEBUG - Response status: {response_data.get('status')}")
 
         # Early return if no data or error status
         if response_data.get("status") != "success" or "data" not in response_data:
@@ -916,12 +984,12 @@ def modify_order(data, auth):
         else:
             return info_response, 400
 
-    logger.info(f"Client ID: {client_id}")
-    logger.info(f"Original order data: {data}")
+    logger.debug(f"Client ID: {client_id}")
+    logger.debug(f"Original order data: {data}")
 
     # Transform OpenAlgo modify order format to Pocketful format
     transformed_data = transform_modify_order_data(data, client_id=client_id)
-    logger.info(f"Transformed order data: {transformed_data}")
+    logger.debug(f"Transformed order data: {transformed_data}")
 
     # Use manual httpx client request to avoid URL path manipulation issues
     client = get_httpx_client()
@@ -930,15 +998,15 @@ def modify_order(data, auth):
     url = f"{BASE_URL}/api/v1/orders"
     headers = {"Authorization": f"Bearer {auth}", "Content-Type": "application/json"}
 
-    logger.info(f"Making direct PUT request to: {url}")
-    logger.info(f"With payload: {json.dumps(transformed_data, indent=2)}")
+    logger.debug(f"Making direct PUT request to: {url}")
+    logger.debug(f"With payload: {json.dumps(transformed_data, indent=2)}")
 
     try:
         # Make direct request using httpx client - bypass get_api_response to have more control
         response = client.put(url, headers=headers, json=transformed_data)
-        logger.info(f"Response status: {response.status_code}")
-        logger.info(f"Response URL: {response.url}")
-        logger.info(f"Response content: {response.text}")
+        logger.debug(f"Response status: {response.status_code}")
+        logger.debug(f"Response URL: {response.url}")
+        logger.debug(f"Response content: {response.text}")
 
         response.raise_for_status()
 
@@ -1035,7 +1103,7 @@ def cancel_all_orders_api(data, auth):
             logger.debug(f"DEBUG - Order statuses found: {statuses}")
 
             # Print a sample order to understand structure
-            logger.info(
+            logger.debug(
                 f"DEBUG - Sample order structure: {pending_orders[0] if pending_orders else 'No orders'}"
             )
 
@@ -1072,7 +1140,7 @@ def cancel_all_orders_api(data, auth):
         logger.debug(f"DEBUG - Found {len(mode_new_orders)} orders with mode=NEW")
         if mode_new_orders:
             for idx, order in enumerate(mode_new_orders):
-                logger.info(
+                logger.debug(
                     f"DEBUG - Mode=NEW order {idx + 1}: status={order.get('status')}, id={order.get('order_id') or order.get('id') or 'unknown'}"
                 )
 
@@ -1082,7 +1150,7 @@ def cancel_all_orders_api(data, auth):
 
     logger.debug(f"DEBUG - Found {len(orders_to_cancel)} open orders to cancel")
     if orders_to_cancel:
-        logger.info(
+        logger.debug(
             f"DEBUG - Order IDs to cancel: {[order.get('order_id', 'Unknown') for order in orders_to_cancel]}"
         )
 
@@ -1110,7 +1178,7 @@ def cancel_all_orders_api(data, auth):
         for field in possible_order_id_fields:
             if field in order and order[field]:
                 orderid = order[field]
-                logger.info(f"DEBUG - Using order ID from field '{field}': {orderid}")
+                logger.debug(f"DEBUG - Using order ID from field '{field}': {orderid}")
                 break
 
         if not orderid:

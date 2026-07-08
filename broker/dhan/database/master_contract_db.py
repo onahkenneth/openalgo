@@ -10,11 +10,12 @@ import shutil
 import numpy as np
 import pandas as pd
 import requests
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from database.auth_db import get_auth_token
+from database.engine_factory import create_db_engine
 from extensions import socketio  # Import SocketIO
 from utils.logging import get_logger
 
@@ -23,7 +24,7 @@ logger = get_logger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
 
-engine = create_engine(DATABASE_URL)
+engine = create_db_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -233,7 +234,7 @@ def process_dhan_csv(path):
     df["expiry"] = df["SEM_EXPIRY_DATE"].str.upper()
     df["strike"] = df["SEM_STRIKE_PRICE"]
     df["lotsize"] = df["SEM_LOT_UNITS"]
-    df["tick_size"] = df["SEM_TICK_SIZE"]
+    df["tick_size"] = pd.to_numeric(df["SEM_TICK_SIZE"], errors="coerce") / 100
     df["brsymbol"] = df["SEM_TRADING_SYMBOL"]
 
     # Apply the function

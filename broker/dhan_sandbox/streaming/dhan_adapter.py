@@ -27,6 +27,17 @@ from .dhan_mapping import get_dhan_exchange, get_openalgo_exchange
 from .dhan_websocket import DhanWebSocket
 
 
+def _get_dhan_client_id() -> str | None:
+    """Extract Dhan client-id from BROKER_API_KEY env value."""
+    broker_api_key = os.getenv("BROKER_API_KEY")
+    if not broker_api_key:
+        return None
+    if ":::" in broker_api_key:
+        client_id, _ = broker_api_key.split(":::", 1)
+        return client_id.strip() or None
+    return broker_api_key.strip() or None
+
+
 class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
     """
     Dhan-specific implementation of the WebSocket adapter.
@@ -60,6 +71,15 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.max_reconnect_delay = 300  # Max 5 minutes between attempts
         self.reconnecting = False  # Flag to prevent multiple concurrent reconnections
 
+        # Subscribe coalescing queue (issue #1344 — mirrors production
+        # broker/dhan/streaming/dhan_adapter.py:67-69). Bursty per-symbol
+        # subscribe() calls collapse into one batched ws_client.subscribe_tokens
+        # call per (mode, exchange) group instead of N individual broker
+        # messages. 500ms window matches the rest of the fleet.
+        self.subscription_queue: list[dict] = []
+        self.batch_timer: threading.Timer | None = None
+        self.batch_delay = 0.5
+
         # Extended mode mapping to handle all possible OpenAlgo modes
         self.mode_map = {
             # Standard OpenAlgo modes
@@ -86,9 +106,11 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Load authentication tokens
         try:
             # Use BROKER_API_KEY as client_id
-            self.client_id = os.getenv("BROKER_API_KEY")
+            self.client_id = _get_dhan_client_id()
             self.logger.info(
-                f"Retrieved API KEY: {self.client_id[:5]}... (length: {len(self.client_id) if self.client_id else 0})"
+                "Client ID loaded: configured=%s length=%s",
+                bool(self.client_id),
+                len(self.client_id) if self.client_id else 0,
             )
             if not self.client_id:
                 error_msg = f"No BROKER_API_KEY available for {self.broker_name} authentication"
@@ -98,7 +120,9 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # Use BROKER_API_SECRET as access_token
             self.access_token = os.getenv("BROKER_API_SECRET")
             self.logger.info(
-                f"Retrieved API SECRET: {self.access_token[:5]}... (length: {len(self.access_token) if self.access_token else 0})"
+                "Access token loaded: configured=%s length=%s",
+                bool(self.access_token),
+                len(self.access_token) if self.access_token else 0,
             )
             if not self.access_token:
                 error_msg = f"No BROKER_API_SECRET available for {self.broker_name} authentication"
@@ -171,6 +195,64 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 "message": f"Error connecting to {self.broker_name} WebSocket: {e}",
             }
 
+    def _start_batch_timer(self):
+        """Arm the coalescing timer that drains subscription_queue.
+
+        Called from within self.lock when a fresh subscribe enters an empty
+        queue. Subsequent enqueues during the window join the same flush.
+        Mirrors broker/dhan/streaming/dhan_adapter.py:161-167.
+        """
+        if self.batch_timer:
+            self.batch_timer.cancel()
+        self.batch_timer = threading.Timer(
+            self.batch_delay, self._process_batch_subscriptions
+        )
+        self.batch_timer.daemon = True
+        self.batch_timer.start()
+
+    def _process_batch_subscriptions(self):
+        """Drain the queue and emit one ws_client.subscribe_tokens call per
+        (mode, exchange_code) group. Mirrors production dhan adapter pattern
+        but adapted for the sandbox's single ws_client architecture.
+        """
+        with self.lock:
+            if not self.subscription_queue:
+                self.batch_timer = None
+                return
+            pending = list(self.subscription_queue)
+            self.subscription_queue.clear()
+            self.batch_timer = None
+            ws_client = self.ws_client
+
+        if not ws_client:
+            self.logger.warning(
+                f"Dropping batch of {len(pending)} subscriptions — ws_client gone"
+            )
+            return
+
+        # Group by (mode, exchange_code) — Dhan's subscribe_tokens accepts
+        # one mode per call, with per-token exchange_codes mapping
+        groups: dict[tuple, dict] = {}
+        for item in pending:
+            key = (item["mode"], item["exchange_code"])
+            grp = groups.setdefault(key, {"tokens": [], "exchange_codes": {}})
+            grp["tokens"].append(item["token"])
+            grp["exchange_codes"][item["token"]] = item["exchange_code"]
+
+        for (mode, exch_code), grp in groups.items():
+            try:
+                ws_client.subscribe_tokens(
+                    grp["tokens"], mode, exchange_codes=grp["exchange_codes"]
+                )
+                self.logger.info(
+                    f"Batch subscribed {len(grp['tokens'])} tokens in mode {mode} "
+                    f"(exchange_code={exch_code})"
+                )
+            except Exception as e:
+                self.logger.error(
+                    f"Batch subscribe failed for mode {mode}: {e}"
+                )
+
     def disconnect(self):
         """
         Disconnect from the Dhan WebSocket server.
@@ -181,6 +263,14 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.logger.info(f"Disconnecting from {self.broker_name} WebSocket server")
 
         try:
+            # Cancel pending batch flush so the timer thread cannot fire
+            # after ws_client is gone (issue #1344).
+            with self.lock:
+                if self.batch_timer:
+                    self.batch_timer.cancel()
+                    self.batch_timer = None
+                self.subscription_queue.clear()
+
             if self.ws_client:
                 self.ws_client.stop()
                 self.ws_client = None
@@ -394,16 +484,23 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 )
                 # Don't fail here - let the subscription attempt proceed
 
-            # Perform subscription
-            success = self.ws_client.subscribe_tokens(
-                [actual_token], dhan_mode, exchange_codes={actual_token: exchange_code}
-            )
-
-            if success:
-                self.logger.info(f"✅ Successfully subscribed to {exchange}:{symbol}")
-            else:
-                self.logger.error(f"❌ Failed to subscribe to {exchange}:{symbol}")
-                return {"status": "error", "message": f"Failed to subscribe to {exchange}:{symbol}"}
+            # Queue for batched subscribe (issue #1344). The actual
+            # ws_client.subscribe_tokens call is dispatched by
+            # _process_batch_subscriptions() after the coalescing window so
+            # bursty per-symbol startups collapse into one broker message
+            # per (mode, exchange-code) group.
+            with self.lock:
+                self.subscription_queue.append(
+                    {
+                        "token": int(actual_token),
+                        "mode": dhan_mode,
+                        "exchange_code": exchange_code,
+                        "symbol": symbol,
+                        "exchange": exchange,
+                    }
+                )
+                if len(self.subscription_queue) == 1:
+                    self._start_batch_timer()
 
             return {"status": "success", "message": f"Subscribed to {exchange}:{symbol}"}
 
@@ -1156,5 +1253,5 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         """Destructor to ensure proper cleanup."""
         try:
             self.disconnect()
-        except:
+        except Exception:
             pass

@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Check, ChevronsUpDown } from 'lucide-react'
 import type * as PlotlyTypes from 'plotly.js'
-import Plot from 'react-plotly.js'
-import { useThemeStore } from '@/stores/themeStore'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { oiProfileApi } from '@/api/oi-profile'
-import { volSurfaceApi, type VolSurfaceData } from '@/api/vol-surface'
+import { type VolSurfaceData, volSurfaceApi } from '@/api/vol-surface'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import {
   Command,
@@ -22,19 +22,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
+import { useSupportedExchanges } from '@/hooks/useSupportedExchanges'
+import Plot from '@/lib/Plot3D'
+import { useThemeStore } from '@/stores/themeStore'
 import { showToast } from '@/utils/toast'
 
-const FNO_EXCHANGES = [
-  { value: 'NFO', label: 'NFO' },
-  { value: 'BFO', label: 'BFO' },
-]
-
-const DEFAULT_UNDERLYINGS: Record<string, string[]> = {
-  NFO: ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'],
-  BFO: ['SENSEX', 'BANKEX'],
-}
+// FNO_EXCHANGES and DEFAULT_UNDERLYINGS are now provided by useSupportedExchanges() hook
 
 const STRIKE_COUNTS = [
   { value: '10', label: '10' },
@@ -57,19 +50,31 @@ function convertExpiryForAPI(expiry: string): string {
 
 export default function VolSurface() {
   const { mode, appMode } = useThemeStore()
+  const { fnoExchanges, defaultFnoExchange, defaultUnderlyings } = useSupportedExchanges()
   const isAnalyzer = appMode === 'analyzer'
   const isDark = mode === 'dark' || isAnalyzer
 
-  const [selectedExchange, setSelectedExchange] = useState('NFO')
-  const [underlyings, setUnderlyings] = useState<string[]>(DEFAULT_UNDERLYINGS.NFO)
+  const [selectedExchange, setSelectedExchange] = useState(defaultFnoExchange)
+  const [underlyings, setUnderlyings] = useState<string[]>(
+    defaultUnderlyings[defaultFnoExchange] || []
+  )
   const [underlyingOpen, setUnderlyingOpen] = useState(false)
-  const [selectedUnderlying, setSelectedUnderlying] = useState('NIFTY')
+  const [selectedUnderlying, setSelectedUnderlying] = useState(
+    defaultUnderlyings[defaultFnoExchange]?.[0] || ''
+  )
   const [expiries, setExpiries] = useState<string[]>([])
   const [selectedExpiries, setSelectedExpiries] = useState<string[]>([])
   const [strikeCount, setStrikeCount] = useState('40')
   const [surfaceData, setSurfaceData] = useState<VolSurfaceData | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const requestIdRef = useRef(0)
+
+  // Re-sync exchange when broker capabilities load asynchronously
+  useEffect(() => {
+    setSelectedExchange((prev) =>
+      prev && fnoExchanges.some((ex) => ex.value === prev) ? prev : defaultFnoExchange
+    )
+  }, [defaultFnoExchange, fnoExchanges])
 
   // Send NFO/BFO directly — backend resolves correct exchange for index vs stock
 
@@ -92,7 +97,7 @@ export default function VolSurface() {
 
   // Fetch underlyings when exchange changes
   useEffect(() => {
-    const defaults = DEFAULT_UNDERLYINGS[selectedExchange] || []
+    const defaults = defaultUnderlyings[selectedExchange] || []
     setUnderlyings(defaults)
     setSelectedUnderlying(defaults[0] || '')
     setExpiries([])
@@ -118,7 +123,7 @@ export default function VolSurface() {
     return () => {
       cancelled = true
     }
-  }, [selectedExchange])
+  }, [selectedExchange, defaultUnderlyings[selectedExchange]])
 
   // Fetch expiries when underlying changes
   useEffect(() => {
@@ -146,22 +151,18 @@ export default function VolSurface() {
     return () => {
       cancelled = true
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedUnderlying])
+  }, [selectedUnderlying, selectedExchange])
 
   // Toggle an expiry selection
-  const toggleExpiry = useCallback(
-    (expiry: string) => {
-      setSelectedExpiries((prev) => {
-        if (prev.includes(expiry)) {
-          return prev.filter((e) => e !== expiry)
-        }
-        if (prev.length >= 8) return prev
-        return [...prev, expiry]
-      })
-    },
-    []
-  )
+  const toggleExpiry = useCallback((expiry: string) => {
+    setSelectedExpiries((prev) => {
+      if (prev.includes(expiry)) {
+        return prev.filter((e) => e !== expiry)
+      }
+      if (prev.length >= 8) return prev
+      return [...prev, expiry]
+    })
+  }, [])
 
   // Load surface data
   const loadData = useCallback(async () => {
@@ -173,7 +174,7 @@ export default function VolSurface() {
         underlying: selectedUnderlying,
         exchange: selectedExchange,
         expiry_dates: selectedExpiries.map(convertExpiryForAPI),
-        strike_count: parseInt(strikeCount),
+        strike_count: parseInt(strikeCount, 10),
       })
       if (requestIdRef.current !== requestId) return
       if (res.status === 'success' && res.data) {
@@ -200,9 +201,7 @@ export default function VolSurface() {
     const expiryLabels = expiryInfo.map((e) => e.date)
 
     // Build customdata for hover: 2D array matching surface shape [expiry_idx][strike_idx]
-    const customdata = surface.map((_, i) =>
-      Array(strikes.length).fill(expiryLabels[i])
-    )
+    const customdata = surface.map((_, i) => Array(strikes.length).fill(expiryLabels[i]))
 
     const data: PlotlyTypes.Data[] = [
       {
@@ -212,8 +211,7 @@ export default function VolSurface() {
         z: surface,
         customdata: customdata as unknown as PlotlyTypes.Datum[][],
         colorscale: themeColors.colorscale as PlotlyTypes.ColorScale,
-        hovertemplate:
-          'Strike: %{x}<br>Expiry: %{customdata}<br>IV: %{z:.2f}%<extra></extra>',
+        hovertemplate: 'Strike: %{x}<br>Expiry: %{customdata}<br>IV: %{z:.2f}%<extra></extra>',
         colorbar: {
           title: { text: 'IV %', font: { color: themeColors.text, size: 12 } },
           tickfont: { color: themeColors.text },
@@ -268,7 +266,7 @@ export default function VolSurface() {
     }
 
     return { data, layout }
-  }, [surfaceData, themeColors, isDark])
+  }, [surfaceData, themeColors])
 
   const plotConfig: Partial<PlotlyTypes.Config> = useMemo(
     () => ({
@@ -297,7 +295,7 @@ export default function VolSurface() {
               <SelectValue placeholder="Exchange" />
             </SelectTrigger>
             <SelectContent>
-              {FNO_EXCHANGES.map((ex) => (
+              {fnoExchanges.map((ex) => (
                 <SelectItem key={ex.value} value={ex.value}>
                   {ex.label}
                 </SelectItem>
@@ -307,7 +305,12 @@ export default function VolSurface() {
 
           <Popover open={underlyingOpen} onOpenChange={setUnderlyingOpen}>
             <PopoverTrigger asChild>
-              <Button variant="outline" role="combobox" aria-expanded={underlyingOpen} className="w-[140px] justify-between">
+              <Button
+                variant="outline"
+                role="combobox"
+                aria-expanded={underlyingOpen}
+                className="w-[140px] justify-between"
+              >
                 {selectedUnderlying || 'Underlying'}
                 <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
               </Button>
@@ -327,7 +330,9 @@ export default function VolSurface() {
                           setUnderlyingOpen(false)
                         }}
                       >
-                        <Check className={`mr-2 h-4 w-4 ${selectedUnderlying === u ? 'opacity-100' : 'opacity-0'}`} />
+                        <Check
+                          className={`mr-2 h-4 w-4 ${selectedUnderlying === u ? 'opacity-100' : 'opacity-0'}`}
+                        />
                         {u}
                       </CommandItem>
                     ))}

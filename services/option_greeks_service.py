@@ -3,30 +3,24 @@ Option Greeks Service
 Calculates option Greeks (Delta, Gamma, Theta, Vega, Rho) and Implied Volatility
 for options across all supported exchanges (NFO, BFO, CDS, MCX)
 
-Uses Black-76 model (py_vollib) - appropriate for options on futures/forwards
-which is the correct model for Indian F&O markets (NFO, BFO, MCX, CDS)
+Uses Black-76 model (opengreeks) - appropriate for options on futures/forwards
+which is the correct model for Indian F&O markets (NFO, BFO, MCX, CDS).
+opengreeks is a Rust reimplementation with byte-identical signatures to py_vollib.
 """
 
 import re
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
+from zoneinfo import ZoneInfo
 
+from utils.constants import CRYPTO_EXCHANGES
 from utils.logging import get_logger
 
-# Import py_vollib for Black-76 calculations
-try:
-    from py_vollib.black.greeks.analytical import delta as black_delta
-    from py_vollib.black.greeks.analytical import gamma as black_gamma
-    from py_vollib.black.greeks.analytical import rho as black_rho
-    from py_vollib.black.greeks.analytical import theta as black_theta
-    from py_vollib.black.greeks.analytical import vega as black_vega
-    from py_vollib.black.implied_volatility import implied_volatility as black_iv
-
-    PYVOLLIB_AVAILABLE = True
-except ImportError:
-    PYVOLLIB_AVAILABLE = False
+# opengreeks is lazy-loaded inside calculate_greeks() and check_opengreeks_availability().
 
 logger = get_logger(__name__)
+
+INDIA_TZ = ZoneInfo("Asia/Kolkata")
 
 # Exchange-specific symbol mappings
 NSE_INDEX_SYMBOLS = {
@@ -73,19 +67,22 @@ DEFAULT_INTEREST_RATES = {
 }
 
 
-def check_pyvollib_availability():
-    """Check if py_vollib library is available"""
-    if not PYVOLLIB_AVAILABLE:
-        logger.error("py_vollib library not installed. Install with: pip install py_vollib")
+def check_opengreeks_availability():
+    """Check if opengreeks library is available"""
+    try:
+        from opengreeks.black76 import implied_volatility as black_iv  # noqa: F401
+
+        return True, None, None
+    except ImportError:
+        logger.error("opengreeks library not installed. Install with: pip install opengreeks")
         return (
             False,
             {
                 "status": "error",
-                "message": "Option Greeks calculation requires py_vollib library. Install with: pip install py_vollib",
+                "message": "Option Greeks calculation requires opengreeks library. Install with: pip install opengreeks",
             },
             500,
         )
-    return True, None, None
 
 
 def parse_option_symbol(
@@ -113,6 +110,9 @@ def parse_option_symbol(
         opt_type: CE or PE
     """
     try:
+        # CRYPTO canonical format (BTC28FEB2580000CE) uses the same
+        # Indian F&O-style symbology as NFO/MCX — the regex below handles both.
+
         # Pattern: SYMBOL + DD + MMM + YY + STRIKE + CE/PE
         # Strike can have decimal point for currencies
         match = re.match(r"([A-Z]+)(\d{2})([A-Z]{3})(\d{2})([\d.]+)(CE|PE)", symbol.upper())
@@ -155,7 +155,9 @@ def parse_option_symbol(
                     )
                 logger.info(f"Using custom expiry time: {custom_expiry_time}")
             except Exception as e:
-                raise ValueError(f"Failed to parse expiry_time '{custom_expiry_time}': {str(e)}")
+                raise ValueError(
+                    f"Failed to parse expiry_time '{custom_expiry_time}': {str(e)}"
+                ) from e
         else:
             # Use default expiry time based on exchange:
             # NFO/BFO: 15:30 (3:30 PM)
@@ -187,7 +189,7 @@ def parse_option_symbol(
 
     except Exception as e:
         logger.exception(f"Error parsing option symbol {symbol}: {e}")
-        raise ValueError(f"Failed to parse option symbol {symbol}: {str(e)}")
+        raise ValueError(f"Failed to parse option symbol {symbol}: {str(e)}") from e
 
 
 def get_underlying_exchange(base_symbol: str, options_exchange: str) -> str:
@@ -213,28 +215,76 @@ def get_underlying_exchange(base_symbol: str, options_exchange: str) -> str:
     if base_symbol in COMMODITY_SYMBOLS or options_exchange == "MCX":
         return "MCX"
 
+    # Crypto options — underlying is on the same exchange
+    if options_exchange.upper() in CRYPTO_EXCHANGES:
+        return options_exchange.upper()
+
     # Default to NSE for equity options
     return "NSE"
 
 
+def _resolve_forward_price(
+    base_symbol: str,
+    options_exchange: str,
+    underlying_exchange: str,
+    expiry: datetime,
+    api_key: str | None,
+    synth_cache: dict | None = None,
+) -> float | None:
+    """
+    Black-76 forward for an option's Greeks: the per-expiry SYNTHETIC FUTURE
+    (ATM_strike + ATM_CE - ATM_PE, put-call parity) for every F&O underlying and
+    expiry — index, stocks, MCX, CDS. Returns None to mean "fall back to spot"
+    (e.g. the synthetic cannot be computed because ATM CE/PE quotes are missing).
+
+    Single source of truth for the forward rule. Cached per
+    (underlying, underlying_exchange, expiry) via synth_cache.
+    """
+    if synth_cache is None:
+        synth_cache = {}
+    expiry_code = expiry.strftime("%d%b%y").upper()  # DDMMMYY, e.g. 26JUN25
+    key = (base_symbol, underlying_exchange, expiry_code)
+    if key in synth_cache:
+        return synth_cache[key]
+
+    price = None
+    try:
+        from services.synthetic_future_service import calculate_synthetic_future
+
+        ok, resp, _ = calculate_synthetic_future(
+            base_symbol, underlying_exchange, expiry_code, api_key
+        )
+        if ok:
+            price = resp.get("synthetic_future_price")
+    except Exception as e:
+        logger.warning(f"Synthetic future calc failed for {base_symbol} {expiry_code}: {e}")
+    synth_cache[key] = price
+    return price
+
+
 def calculate_time_to_expiry(expiry: datetime) -> tuple[float, float]:
     """
-    Calculate time to expiry in years (for py_vollib Black-76 model)
+    Calculate time to expiry in years (for the Black-76 model).
 
-    py_vollib expects time to expiry in YEARS.
+    The math library (opengreeks) expects time to expiry in YEARS.
     Also returns days for display purposes.
 
     Returns:
         Tuple of (time_in_years, time_in_days)
     """
-    current_time = datetime.now()
+    if expiry.tzinfo is None:
+        expiry_for_calc = expiry.replace(tzinfo=INDIA_TZ)
+        current_time = datetime.now(INDIA_TZ)
+    else:
+        expiry_for_calc = expiry
+        current_time = datetime.now(expiry.tzinfo)
 
-    if expiry < current_time:
-        logger.warning(f"Option has already expired: {expiry}")
+    if expiry_for_calc < current_time:
+        logger.warning(f"Option has already expired: {expiry_for_calc}")
         return 0.0, 0.0
 
     # Calculate time to expiry
-    time_delta = expiry - current_time
+    time_delta = expiry_for_calc - current_time
     days_to_expiry = time_delta.total_seconds() / (60 * 60 * 24)
     years_to_expiry = days_to_expiry / 365.0
 
@@ -249,6 +299,54 @@ def calculate_time_to_expiry(expiry: datetime) -> tuple[float, float]:
     return years_to_expiry, days_to_expiry
 
 
+def _expired_option_greeks_response(
+    option_symbol: str,
+    exchange: str,
+    base_symbol: str,
+    expiry: datetime,
+    strike: float,
+    opt_type: str,
+    spot_price: float,
+    option_price: float,
+    interest_rate: float | None,
+) -> dict[str, Any]:
+    """Return a stable batch response for expired option legs."""
+    if opt_type == "CE":
+        intrinsic_value = max(spot_price - strike, 0)
+    else:
+        intrinsic_value = max(strike - spot_price, 0)
+
+    return {
+        "status": "success",
+        "symbol": option_symbol,
+        "exchange": exchange,
+        "underlying": base_symbol,
+        "strike": round(strike, 2),
+        "option_type": opt_type,
+        "expiry_date": expiry.strftime("%d-%b-%Y"),
+        "days_to_expiry": 0,
+        "spot_price": round(spot_price, 2),
+        "option_price": round(option_price, 2),
+        "intrinsic_value": round(intrinsic_value, 2),
+        "time_value": round(max(option_price - intrinsic_value, 0), 2),
+        "interest_rate": round(interest_rate or 0, 2),
+        "implied_volatility": 0,
+        "greeks": {
+            "delta": 0,
+            "gamma": 0,
+            "theta": 0,
+            "vega": 0,
+            "rho": 0,
+        },
+        "note": "Option has expired - Greeks are no longer applicable",
+    }
+
+
+def _is_expired_option_response(response: dict[str, Any]) -> bool:
+    message = str(response.get("message", "")).lower()
+    return "option has expired" in message
+
+
 def calculate_greeks(
     option_symbol: str,
     exchange: str,
@@ -259,7 +357,7 @@ def calculate_greeks(
     api_key: str = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
-    Calculate Option Greeks using Black-76 model (py_vollib)
+    Calculate Option Greeks using Black-76 model (opengreeks)
 
     Black-76 is the appropriate model for options on futures/forwards,
     which includes Indian F&O markets (NFO, BFO, MCX, CDS).
@@ -277,10 +375,26 @@ def calculate_greeks(
         Tuple of (success, response_dict, status_code)
     """
     try:
-        # Check if py_vollib is available
-        available, error_response, status_code = check_pyvollib_availability()
-        if not available:
-            return False, error_response, status_code
+        # opengreeks is lazy-loaded to keep startup snappy (Rust core, NumPy-only deps).
+        try:
+            from opengreeks import black76
+
+            black_delta = black76.delta
+            black_gamma = black76.gamma
+            black_iv = black76.implied_volatility
+            black_rho = black76.rho
+            black_theta = black76.theta
+            black_vega = black76.vega
+        except ImportError:
+            logger.error("opengreeks library not installed.")
+            return (
+                False,
+                {
+                    "status": "error",
+                    "message": "Option Greeks calculation requires opengreeks library. Install with: pip install opengreeks",
+                },
+                500,
+            )
 
         # Parse option symbol with custom expiry time if provided
         base_symbol, expiry, strike, opt_type = parse_option_symbol(
@@ -305,7 +419,7 @@ def calculate_greeks(
             interest_rate = DEFAULT_INTEREST_RATES.get(exchange, 0)
 
         # Convert interest rate from percentage to decimal
-        # py_vollib expects decimal (0.065 for 6.5%)
+        # opengreeks expects decimal (0.065 for 6.5%)
         interest_rate_decimal = interest_rate / 100.0
 
         # Validate inputs
@@ -319,7 +433,7 @@ def calculate_greeks(
         if strike <= 0:
             return False, {"status": "error", "message": "Strike price must be positive"}, 400
 
-        # Set option flag for py_vollib ('c' for call, 'p' for put)
+        # Set option flag for opengreeks ('c' for call, 'p' for put)
         flag = "c" if opt_type == "CE" else "p"
 
         # Calculate intrinsic value to validate option price
@@ -463,7 +577,7 @@ def calculate_greeks(
                 implied_volatility_decimal,
             )
 
-            # Note: py_vollib Black model returns Greeks in trader-friendly units:
+            # Note: opengreeks Black-76 returns Greeks in trader-friendly units:
             # - theta: already daily theta (no conversion needed)
             # - vega: already per 1% vol change (no conversion needed)
 
@@ -569,21 +683,37 @@ def get_option_greeks(
             else:
                 spot_exchange = get_underlying_exchange(base_symbol, exchange)
 
-            # Fetch underlying price
-            logger.info(f"Fetching spot price for {spot_symbol} from {spot_exchange}")
-            success, spot_response, status_code = get_quotes(spot_symbol, spot_exchange, api_key)
-
-            if not success:
-                return (
-                    False,
-                    {
-                        "status": "error",
-                        "message": f"Failed to fetch underlying price: {spot_response.get('message', 'Unknown error')}",
-                    },
-                    status_code,
+            # Black-76 forward = per-expiry synthetic future for all F&O; spot
+            # fallback. Skipped when the caller supplied a custom underlying
+            # (e.g. a FUT symbol).
+            resolved_forward = None
+            if not underlying_symbol or underlying_symbol == base_symbol:
+                resolved_forward = _resolve_forward_price(
+                    base_symbol, exchange, spot_exchange, expiry, api_key
                 )
 
-            spot_price = spot_response.get("data", {}).get("ltp")
+            if resolved_forward:
+                spot_price = resolved_forward
+                logger.info(
+                    f"Using forward {resolved_forward} for {option_symbol}"
+                )
+                success = True
+            else:
+                # Fetch underlying spot price
+                logger.info(f"Fetching spot price for {spot_symbol} from {spot_exchange}")
+                success, spot_response, status_code = get_quotes(spot_symbol, spot_exchange, api_key)
+
+                if not success:
+                    return (
+                        False,
+                        {
+                            "status": "error",
+                            "message": f"Failed to fetch underlying price: {spot_response.get('message', 'Unknown error')}",
+                        },
+                        status_code,
+                    )
+
+                spot_price = spot_response.get("data", {}).get("ltp")
             if not spot_price:
                 return False, {"status": "error", "message": "Underlying LTP not available"}, 404
 
@@ -629,7 +759,8 @@ def get_multi_option_greeks(
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get option Greeks for multiple symbols in a single call.
-    Uses concurrent execution for efficiency.
+    Optimized to fetch spot prices once per underlying and batch option prices
+    via get_multiquotes(), minimizing broker API calls.
 
     Args:
         symbols: List of dicts with 'symbol', 'exchange', optional 'underlying_symbol', 'underlying_exchange'
@@ -640,7 +771,7 @@ def get_multi_option_greeks(
     Returns:
         Tuple of (success, response_dict, status_code)
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from services.quotes_service import get_multiquotes, get_quotes
 
     # Early return for empty symbols list
     if not symbols:
@@ -654,63 +785,169 @@ def get_multi_option_greeks(
     success_count = 0
     failed_count = 0
 
-    def fetch_single_greeks(symbol_request):
-        """Fetch Greeks for a single symbol"""
-        try:
-            symbol = symbol_request.get("symbol")
-            exchange = symbol_request.get("exchange")
-            underlying_symbol = symbol_request.get("underlying_symbol")
-            underlying_exchange = symbol_request.get("underlying_exchange")
+    # Step 1: Parse all symbols and group by underlying for spot price fetch
+    parsed_symbols = {}  # symbol -> (base_symbol, expiry, strike, opt_type)
+    spot_keys = {}  # (spot_symbol, spot_exchange) -> spot_price
+    symbol_to_spot_key = {}  # symbol -> (spot_symbol, spot_exchange)
+    symbol_forward = {}  # symbol -> Black-76 forward (synthetic future)
+    synth_cache = {}  # (base, underlying_exchange, expiry_code) -> synthetic future
 
-            success, response, status_code = get_option_greeks(
+    for sym_req in symbols:
+        symbol = sym_req.get("symbol")
+        exchange = sym_req.get("exchange")
+        try:
+            base_symbol, expiry, strike, opt_type = parse_option_symbol(symbol, exchange, expiry_time)
+            parsed_symbols[symbol] = (base_symbol, expiry, strike, opt_type)
+
+            # Determine spot symbol/exchange for this option (also the fallback
+            # if the synthetic future cannot be computed for an index weekly)
+            passed_underlying = sym_req.get("underlying_symbol")
+            spot_symbol = passed_underlying or base_symbol
+            spot_exchange = sym_req.get("underlying_exchange") or get_underlying_exchange(base_symbol, exchange)
+            spot_key = (spot_symbol, spot_exchange)
+            spot_keys[spot_key] = None  # will be filled with price
+            symbol_to_spot_key[symbol] = spot_key
+
+            # Black-76 forward = per-expiry synthetic future for all F&O; spot
+            # fallback. Skipped if the caller passed a custom underlying
+            # (e.g. an explicit FUT symbol).
+            if not passed_underlying or passed_underlying == base_symbol:
+                forward = _resolve_forward_price(
+                    base_symbol, exchange, spot_exchange, expiry, api_key, synth_cache
+                )
+                if forward:
+                    symbol_forward[symbol] = forward
+        except Exception as e:
+            logger.warning(f"Failed to parse symbol {symbol}: {e}")
+            failed_count += 1
+            results.append({
+                "status": "error",
+                "symbol": symbol,
+                "exchange": exchange,
+                "message": f"Failed to parse option symbol: {str(e)}",
+            })
+
+    # Step 2: Fetch spot prices — one API call per unique underlying
+    for spot_key in spot_keys:
+        spot_symbol, spot_exchange = spot_key
+        try:
+            logger.info(f"Fetching spot price for {spot_symbol} from {spot_exchange}")
+            success, spot_response, status_code = get_quotes(spot_symbol, spot_exchange, api_key)
+            if success:
+                spot_price = spot_response.get("data", {}).get("ltp")
+                if spot_price:
+                    spot_keys[spot_key] = spot_price
+                else:
+                    logger.warning(f"No LTP in spot response for {spot_symbol}")
+            else:
+                logger.warning(f"Failed to fetch spot for {spot_symbol}: {spot_response.get('message')}")
+        except Exception as e:
+            logger.warning(f"Error fetching spot for {spot_symbol}: {e}")
+
+    # Step 3: Batch fetch all option prices via get_multiquotes()
+    option_symbols_to_fetch = []
+    for sym_req in symbols:
+        symbol = sym_req.get("symbol")
+        if symbol in parsed_symbols:  # only if parsing succeeded
+            option_symbols_to_fetch.append({
+                "symbol": symbol,
+                "exchange": sym_req.get("exchange"),
+            })
+
+    option_prices = {}  # symbol -> ltp
+    if option_symbols_to_fetch:
+        logger.info(f"Batch fetching {len(option_symbols_to_fetch)} option prices via multiquotes")
+        try:
+            mq_success, mq_response, mq_status = get_multiquotes(
+                symbols=option_symbols_to_fetch, api_key=api_key
+            )
+            if mq_success and "results" in mq_response:
+                for result in mq_response["results"]:
+                    sym = result.get("symbol")
+                    if sym and "data" in result:
+                        ltp = result["data"].get("ltp")
+                        if ltp:
+                            option_prices[sym] = ltp
+        except Exception as e:
+            logger.warning(f"Multiquotes fetch failed: {e}")
+
+    # Step 4: Calculate Greeks for each symbol using fetched prices
+    for sym_req in symbols:
+        symbol = sym_req.get("symbol")
+        exchange = sym_req.get("exchange")
+
+        # Skip if already failed during parsing
+        if symbol not in parsed_symbols:
+            continue
+
+        # Forward price: synthetic future for index weeklies, else spot.
+        # Falls back to spot if the synthetic future could not be computed.
+        spot_key = symbol_to_spot_key.get(symbol)
+        spot_price = symbol_forward.get(symbol) or (spot_keys.get(spot_key) if spot_key else None)
+        if not spot_price:
+            failed_count += 1
+            results.append({
+                "status": "error",
+                "symbol": symbol,
+                "exchange": exchange,
+                "message": f"Failed to fetch underlying price for {spot_key[0] if spot_key else 'unknown'}",
+            })
+            continue
+
+        # Get option price
+        option_price = option_prices.get(symbol)
+        if not option_price:
+            failed_count += 1
+            results.append({
+                "status": "error",
+                "symbol": symbol,
+                "exchange": exchange,
+                "message": "Option LTP not available",
+            })
+            continue
+
+        # Calculate Greeks (pure math, no API calls)
+        try:
+            calc_success, calc_response, calc_status = calculate_greeks(
                 option_symbol=symbol,
                 exchange=exchange,
+                spot_price=spot_price,
+                option_price=option_price,
                 interest_rate=interest_rate,
-                forward_price=None,  # Not supported in batch mode
-                underlying_symbol=underlying_symbol,
-                underlying_exchange=underlying_exchange,
                 expiry_time=expiry_time,
                 api_key=api_key,
             )
-
-            return {
-                "success": success,
-                "response": response,
+            if calc_success:
+                success_count += 1
+            else:
+                if _is_expired_option_response(calc_response):
+                    base_symbol, expiry, strike, opt_type = parsed_symbols[symbol]
+                    calc_response = _expired_option_greeks_response(
+                        option_symbol=symbol,
+                        exchange=exchange,
+                        base_symbol=base_symbol,
+                        expiry=expiry,
+                        strike=strike,
+                        opt_type=opt_type,
+                        spot_price=spot_price,
+                        option_price=option_price,
+                        interest_rate=interest_rate,
+                    )
+                    success_count += 1
+                else:
+                    failed_count += 1
+                    calc_response.setdefault("symbol", symbol)
+                    calc_response.setdefault("exchange", exchange)
+            results.append(calc_response)
+        except Exception as e:
+            logger.exception(f"Error calculating Greeks for {symbol}: {e}")
+            failed_count += 1
+            results.append({
+                "status": "error",
                 "symbol": symbol,
                 "exchange": exchange,
-            }
-        except Exception as e:
-            logger.exception(f"Error fetching Greeks for {symbol_request.get('symbol')}: {e}")
-            return {
-                "success": False,
-                "response": {
-                    "status": "error",
-                    "symbol": symbol_request.get("symbol"),
-                    "exchange": symbol_request.get("exchange"),
-                    "message": str(e),
-                },
-                "symbol": symbol_request.get("symbol"),
-                "exchange": symbol_request.get("exchange"),
-            }
-
-    # Use ThreadPoolExecutor for parallel execution
-    # Limit workers to avoid overwhelming the broker API
-    max_workers = min(len(symbols), 10)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        future_to_symbol = {executor.submit(fetch_single_greeks, sym): sym for sym in symbols}
-
-        # Collect results as they complete
-        for future in as_completed(future_to_symbol):
-            result = future.result()
-
-            if result["success"]:
-                success_count += 1
-                results.append(result["response"])
-            else:
-                failed_count += 1
-                results.append(result["response"])
+                "message": str(e),
+            })
 
     # Sort results to maintain original order
     symbol_order = {sym["symbol"]: idx for idx, sym in enumerate(symbols)}
@@ -721,6 +958,23 @@ def get_multi_option_greeks(
         "data": results,
         "summary": {"total": len(symbols), "success": success_count, "failed": failed_count},
     }
+    if failed_count > 0:
+        messages = []
+        for result in results:
+            if result.get("status") == "error" and result.get("message"):
+                message = result["message"]
+                if message not in messages:
+                    messages.append(message)
+        if messages:
+            if response["status"] == "error":
+                response["message"] = (
+                    f"All option Greeks calculations failed: {'; '.join(messages[:3])}"
+                )
+            else:
+                response["message"] = (
+                    f"{failed_count} option Greeks calculation(s) failed: "
+                    f"{'; '.join(messages[:3])}"
+                )
 
     logger.info(f"Multi Greeks completed: {success_count}/{len(symbols)} successful")
 

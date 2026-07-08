@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+import time
 from typing import Any, Dict, Optional
 
 import httpx
@@ -63,7 +65,7 @@ def get_api_response(
             )
 
         response.raise_for_status()
-        logger.info(f"Response: {response.json()}")
+        logger.debug(f"Response: {response.json()}")
         return response.json()
 
     except httpx.HTTPStatusError as e:
@@ -152,7 +154,7 @@ def get_positions(auth: str) -> dict[str, Any]:
             current_retry += 1
             logger.debug(f"Timeout getting positions (attempt {current_retry}/{max_retries}): {e}")
             if current_retry >= max_retries:
-                logger.info("Maximum retries reached for positions data. Returning empty result.")
+                logger.debug("Maximum retries reached for positions data. Returning empty result.")
                 return {"body": {"NetPositionDetail": []}}  # Return empty position structure
         except Exception as e:
             logger.error(f"Error getting positions: {e}")
@@ -180,6 +182,47 @@ def get_holdings(auth: str) -> dict[str, Any]:
         raise
 
 
+# --- Per-Symbol Smart Order Lock ---
+_symbol_locks = {}
+_symbol_locks_lock = threading.Lock()
+
+# --- Position Book Cache ---
+_position_cache = {}
+_position_cache_lock = threading.Lock()
+_POSITION_CACHE_TTL = 1.0
+
+
+def _get_symbol_lock(symbol, exchange, product):
+    """Get or create a per-symbol lock for serializing smart orders."""
+    key = f"{symbol}:{exchange}:{product}"
+    with _symbol_locks_lock:
+        if key not in _symbol_locks:
+            _symbol_locks[key] = threading.Lock()
+        return _symbol_locks[key]
+
+
+def _get_cached_positions(auth):
+    """Get positions from cache if fresh, otherwise fetch from broker API."""
+    with _position_cache_lock:
+        now = time.monotonic()
+        cached = _position_cache.get(auth)
+        if cached and (now - cached["timestamp"]) < _POSITION_CACHE_TTL:
+            return cached["data"]
+
+    positions_data = get_positions(auth)
+
+    with _position_cache_lock:
+        _position_cache[auth] = {"data": positions_data, "timestamp": time.monotonic()}
+
+    return positions_data
+
+
+def _invalidate_position_cache(auth):
+    """Invalidate the position cache so the next queued order fetches fresh data."""
+    with _position_cache_lock:
+        _position_cache.pop(auth, None)
+
+
 def get_open_position(
     tradingsymbol: str, exchange: str, Exch: str, ExchType: str, producttype: str, auth: str
 ) -> str:
@@ -200,7 +243,7 @@ def get_open_position(
         # Convert Trading Symbol from OpenAlgo Format to Broker Format Before Search in OpenPosition
         token = int(get_token(tradingsymbol, exchange))  # Convert token to integer
         tradingsymbol = get_br_symbol(tradingsymbol, exchange)
-        positions_data = get_positions(auth)
+        positions_data = _get_cached_positions(auth)
 
         logger.debug("Token : ", token)
         logger.debug("Product Type : ", producttype)
@@ -211,9 +254,9 @@ def get_open_position(
             and positions_data.get("body")
             and positions_data["body"].get("NetPositionDetail")
         ):
-            logger.info(f"Found {len(positions_data['body']['NetPositionDetail'])} positions")
+            logger.debug(f"Found {len(positions_data['body']['NetPositionDetail'])} positions")
         else:
-            logger.info("No position data available")
+            logger.debug("No position data available")
 
         net_qty = "0"
 
@@ -229,7 +272,7 @@ def get_open_position(
                 position_product = position.get("OrderFor")
 
                 # Detailed logging for position matching
-                logger.info(
+                logger.debug(
                     f"Checking position - Token: {position_token}, Exch: {position_exch}, ExchType: {position_exch_type}, Product: {position_product}"
                 )
 
@@ -240,7 +283,7 @@ def get_open_position(
                     and position_product == producttype
                 ):
                     net_qty = position.get("NetQty", "0")
-                    logger.info(f"Found matching position with quantity: {net_qty}")
+                    logger.debug(f"Found matching position with quantity: {net_qty}")
                     break  # Found the match we need
 
         return net_qty
@@ -253,12 +296,21 @@ def place_order_api(data: dict[str, Any], auth: str) -> dict[str, Any]:
     AUTH_TOKEN = auth
 
     token = get_token(data["symbol"], data["exchange"])
-    newdata = transform_data(data, token)
+    # Pass the auth token so transform_data can fetch quotes for Market Price
+    # Protection (5Paisa rejects plain market orders; MARKET -> protected LIMIT).
+    newdata = transform_data(data, token, AUTH_TOKEN)
     headers = {"Content-Type": "application/json", "Authorization": f"bearer {AUTH_TOKEN}"}
 
     json_data = {"head": {"key": api_key}, "body": newdata}
 
     payload = json.dumps(json_data)
+
+    # Log the order body at INFO so placements are captured even at the default
+    # INFO level. We deliberately log only `body`, never the full payload: the
+    # `head.key` field carries the broker API key in plaintext and the JSON key
+    # name "key" is NOT covered by the logger's redaction patterns, so logging
+    # the whole payload would leak the credential to app logs on every order.
+    logger.info(f"5Paisa PlaceOrder request body: {json.dumps(newdata)}")
 
     try:
         # Get the shared httpx client
@@ -273,15 +325,51 @@ def place_order_api(data: dict[str, Any], auth: str) -> dict[str, Any]:
         response.raise_for_status()
         response_data = response.json()
 
-        logger.info(f"Order Response: {response_data}")
+        logger.info(f"5Paisa PlaceOrder response: {response_data}")
 
-        if response_data["head"]["statusDescription"] == "Success":
-            orderid = response_data["body"]["BrokerOrderID"]
+        head = response_data.get("head", {}) or {}
+        body = response_data.get("body", {}) or {}
+        broker_order_id = body.get("BrokerOrderID", 0)
+        body_status = body.get("Status")
+        broker_message = body.get("Message", "")
+
+        # 5Paisa sends Status as int 0, but normalize in case it arrives as "0".
+        try:
+            status_ok = int(body_status) == 0
+        except (TypeError, ValueError):
+            status_ok = False
+
+        # 5Paisa returns HTTP 200 with head.statusDescription == "Success" even
+        # when the order is rejected by RMS. A genuinely accepted order has
+        # body.Status == 0 AND a non-zero BrokerOrderID. Anything else (margin
+        # shortfall, market closed, invalid scrip, etc.) is a rejection and must
+        # NOT be reported as a phantom success with orderid 0.
+        if (
+            head.get("statusDescription") == "Success"
+            and status_ok
+            and broker_order_id
+        ):
+            orderid = broker_order_id
+            # Add status attribute to make it compatible with place_order.py
+            response.status = response.status_code
         else:
             orderid = None
-
-        # Add status attribute to make it compatible with place_order.py
-        response.status = response.status_code
+            reason = (
+                broker_message
+                or head.get("statusDescription")
+                or "Order rejected by 5Paisa"
+            )
+            logger.error(
+                f"5Paisa order rejected - Status: {body_status}, "
+                f"BrokerOrderID: {broker_order_id}, "
+                f"RMSResponseCode: {body.get('RMSResponseCode')}, Message: {reason}"
+            )
+            # Surface the broker's rejection reason to the service layer, which
+            # reads response_data.get("message") and res.status.
+            response_data["message"] = reason
+            # Force a non-200 status so place_order_service reports an error
+            # instead of a success with orderid 0.
+            response.status = 400
 
         return response, response_data, orderid
 
@@ -300,6 +388,17 @@ def place_smartorder_api(data: dict[str, Any], auth: str) -> dict[str, Any]:
     symbol = data.get("symbol")
     exchange = data.get("exchange")
     product = data.get("product")
+
+    # Per-symbol lock: serialize smart orders per symbol
+    symbol_lock = _get_symbol_lock(symbol, exchange, product)
+
+    with symbol_lock:
+        return _place_smartorder_locked(data, AUTH_TOKEN, symbol, exchange, product)
+
+
+def _place_smartorder_locked(data, AUTH_TOKEN, symbol, exchange, product):
+    """Inner smart order logic, called under per-symbol lock."""
+    res = None
     position_size = int(data.get("position_size", "0"))
 
     exch = map_exchange(exchange)
@@ -310,8 +409,8 @@ def place_smartorder_api(data: dict[str, Any], auth: str) -> dict[str, Any]:
         get_open_position(symbol, exchange, exch, exchtype, map_product_type(product), AUTH_TOKEN)
     )
 
-    logger.info(f"position_size : {position_size}")
-    logger.info(f"Open Position : {current_position}")
+    logger.debug(f"position_size : {position_size}")
+    logger.debug(f"Open Position : {current_position}")
 
     # Determine action based on position_size and current_position
     action = None
@@ -321,11 +420,10 @@ def place_smartorder_api(data: dict[str, Any], auth: str) -> dict[str, Any]:
     if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
         action = data["action"]
         quantity = data["quantity"]
-        # logger.info(f"action : {action}")
-        # logger.info(f"Quantity : {quantity}")
+        # logger.debug(f"action : {action}")
+        # logger.debug(f"Quantity : {quantity}")
         res, response, orderid = place_order_api(data, AUTH_TOKEN)
-        # logger.info(f"{res}")
-        # logger.info(f"{response}")
+        _invalidate_position_cache(AUTH_TOKEN)
 
         return res, response, orderid
 
@@ -356,11 +454,11 @@ def place_smartorder_api(data: dict[str, Any], auth: str) -> dict[str, Any]:
         if position_size > current_position:
             action = "BUY"
             quantity = position_size - current_position
-            # logger.info(f"smart buy quantity : {quantity}")
+            # logger.debug(f"smart buy quantity : {quantity}")
         elif position_size < current_position:
             action = "SELL"
             quantity = current_position - position_size
-            # logger.info(f"smart sell quantity : {quantity}")
+            # logger.debug(f"smart sell quantity : {quantity}")
 
     if action:
         # Prepare data for placing the order
@@ -368,12 +466,12 @@ def place_smartorder_api(data: dict[str, Any], auth: str) -> dict[str, Any]:
         order_data["action"] = action
         order_data["quantity"] = str(quantity)
 
-        # logger.info(f"{order_data}")
+        # logger.debug(f"{order_data}")
         # Place the order
-        res, response, orderid = place_order_api(order_data, auth)
-        # logger.info(f"{res}")
-        logger.info(f"{response}")
-        logger.info(f"{orderid}")
+        res, response, orderid = place_order_api(order_data, AUTH_TOKEN)
+        _invalidate_position_cache(AUTH_TOKEN)
+        logger.debug(f"{response}")
+        logger.debug(f"{orderid}")
 
         return res, response, orderid
 
@@ -383,7 +481,7 @@ def close_all_positions(current_api_key: str, auth: str) -> dict[str, Any]:
     AUTH_TOKEN = auth
 
     positions_response = get_positions(AUTH_TOKEN)
-    logger.info(f"{positions_response}")
+    logger.debug(f"{positions_response}")
     # Check if the positions data is null or empty
     if (
         positions_response["body"]["NetPositionDetail"] is None
@@ -419,14 +517,14 @@ def close_all_positions(current_api_key: str, auth: str) -> dict[str, Any]:
                 "quantity": str(quantity),
             }
 
-            logger.info(f"{place_order_payload}")
+            logger.debug(f"{place_order_payload}")
 
             # Place the order to close the position
             res, response, orderid = place_order_api(place_order_payload, auth)
 
-            # logger.info(f"{res}")
-            # logger.info(f"{response}")
-            # logger.info(f"{orderid}")
+            # logger.debug(f"{res}")
+            # logger.debug(f"{response}")
+            # logger.debug(f"{orderid}")
 
             # Note: Ensure place_order_api handles any errors and logs accordingly
 
@@ -460,10 +558,10 @@ def cancel_order(orderid: str, auth: str) -> dict[str, Any]:
                 break
 
         if not order_details:
-            logger.info(f"Order not found in orderbook: {orderid}")
+            logger.debug(f"Order not found in orderbook: {orderid}")
             return {"status": "error", "message": f"Order not found: {orderid}"}, 404
 
-        logger.info(f"Found order: {order_details}")
+        logger.debug(f"Found order: {order_details}")
 
         # According to the official 5Paisa documentation, we only need the ExchOrderID
         # For pending orders that don't have an ExchOrderID, we cannot cancel them directly
@@ -473,7 +571,7 @@ def cancel_order(orderid: str, auth: str) -> dict[str, Any]:
         if order_details["OrderStatus"] == "Pending" and (
             not exchange_order_id or exchange_order_id == ""
         ):
-            logger.info("Order is in Pending status with no exchange ID yet. Cannot cancel.")
+            logger.debug("Order is in Pending status with no exchange ID yet. Cannot cancel.")
             return {
                 "status": "error",
                 "message": "Order is still pending at broker level. Cannot cancel until it reaches exchange.",
@@ -482,8 +580,8 @@ def cancel_order(orderid: str, auth: str) -> dict[str, Any]:
         # Build the cancel request based on the official 5Paisa documentation
         cancel_data = {"head": {"key": api_key}, "body": {"ExchOrderID": exchange_order_id}}
 
-        logger.info(f"Cancelling order with status: {order_details['OrderStatus']}")
-        logger.info(f"Using ExchOrderID: {exchange_order_id} for cancellation")
+        logger.debug(f"Cancelling order with status: {order_details['OrderStatus']}")
+        logger.debug(f"Using ExchOrderID: {exchange_order_id} for cancellation")
 
         # Get the shared httpx client
         client = get_httpx_client()
@@ -491,13 +589,13 @@ def cancel_order(orderid: str, auth: str) -> dict[str, Any]:
         # Make API request
         headers = {"Authorization": f"bearer {AUTH_TOKEN}", "Content-Type": "application/json"}
 
-        logger.info(f"Cancel order request: {json.dumps(cancel_data)}")
+        logger.debug(f"Cancel order request: {json.dumps(cancel_data)}")
         response = client.post(
             f"{BASE_URL}/VendorsAPI/Service1.svc/V1/CancelOrderRequest",  # Official endpoint for cancel
             json=cancel_data,
             headers=headers,
         )
-        logger.info(f"Cancel order response: {response.text}")
+        logger.debug(f"Cancel order response: {response.text}")
         response.raise_for_status()
         data = response.json()
 
@@ -549,7 +647,7 @@ def modify_order(data: dict[str, Any], auth: str) -> dict[str, Any]:
 
         # Get the actual exchange order ID from the matched order
         exchange_order_id = matched_order.get("ExchOrderID", "")
-        logger.info(
+        logger.debug(
             f"Found order: {matched_order['BrokerOrderId']}, Exchange Order ID: {exchange_order_id}"
         )
 
@@ -565,7 +663,7 @@ def modify_order(data: dict[str, Any], auth: str) -> dict[str, Any]:
         # Prepare request data
         json_data = {"head": {"key": api_key}, "body": transformed_data}
 
-        logger.info(f"Modify Order Request: {json_data}")
+        logger.debug(f"Modify Order Request: {json_data}")
 
         # Get the shared httpx client
         client = get_httpx_client()
@@ -581,7 +679,7 @@ def modify_order(data: dict[str, Any], auth: str) -> dict[str, Any]:
         response.raise_for_status()
         result = response.json()
 
-        logger.info(f"Modify Order Response: {result}")
+        logger.debug(f"Modify Order Response: {result}")
 
         if result.get("head", {}).get("status") == "0":
             # Status 0 means success per API documentation
@@ -635,12 +733,12 @@ def cancel_all_orders_api(data: dict[str, Any], auth: str) -> dict[str, Any]:
                     canceled_orders.append(orderid)
                 else:
                     failed_cancellations.append(orderid)
-                    logger.info(
+                    logger.debug(
                         f"Failed to cancel order {orderid}: {cancel_response.get('message')}"
                     )
 
             except Exception as e:
-                logger.info(f"Error cancelling order {order['BrokerOrderId']}: {e}")
+                logger.debug(f"Error cancelling order {order['BrokerOrderId']}: {e}")
                 failed_cancellations.append(order["BrokerOrderId"])
 
         return canceled_orders, failed_cancellations

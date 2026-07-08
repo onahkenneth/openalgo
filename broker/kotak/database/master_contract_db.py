@@ -9,11 +9,12 @@ import shutil
 import httpx
 import numpy as np
 import pandas as pd
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from database.auth_db import get_auth_token
+from database.engine_factory import create_db_engine
 from database.user_db import find_user_by_username
 from extensions import socketio  # Import SocketIO
 from utils.httpx_client import get_httpx_client
@@ -24,7 +25,7 @@ logger = get_logger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
 
-engine = create_engine(DATABASE_URL)
+engine = create_db_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -150,7 +151,7 @@ def process_kotak_nse_csv(path):
     filtereddataframe["expiry"] = df["pExpiryDate"]
     filtereddataframe["strike"] = df["dStrikePrice;"]
     filtereddataframe["lotsize"] = df["lLotSize"]
-    filtereddataframe["tick_size"] = df["dTickSize "]
+    filtereddataframe["tick_size"] = pd.to_numeric(df["dTickSize "], errors="coerce") / 100
     filtereddataframe["brsymbol"] = df["pTrdSymbol"]
     filtereddataframe["symbol"] = df["pSymbolName"]
 
@@ -199,7 +200,7 @@ def process_kotak_bse_csv(path):
     filtereddataframe["expiry"] = df["pExpiryDate"]
     filtereddataframe["strike"] = df["dStrikePrice"]
     filtereddataframe["lotsize"] = df["lLotSize"]
-    filtereddataframe["tick_size"] = df["dTickSize"]
+    filtereddataframe["tick_size"] = pd.to_numeric(df["dTickSize"], errors="coerce") / 100
     filtereddataframe["brsymbol"] = df["pTrdSymbol"]
     filtereddataframe["symbol"] = df["pSymbolName"]
 
@@ -266,7 +267,7 @@ def process_kotak_nfo_csv(path):
     tokensymbols["strike"] = tokensymbols["strike"].apply(lambda x: int(x) if x.is_integer() else x)
 
     tokensymbols["lotsize"] = df["lLotSize"]
-    tokensymbols["tick_size"] = df["dTickSize"]
+    tokensymbols["tick_size"] = pd.to_numeric(df["dTickSize"], errors="coerce") / 100
     tokensymbols["brsymbol"] = df["pTrdSymbol"]
     tokensymbols["brexchange"] = df["pExchSeg"]
     tokensymbols["exchange"] = "NFO"
@@ -444,7 +445,7 @@ def process_kotak_cds_csv(path):
     tokensymbols["strike"] = tokensymbols["strike"].apply(lambda x: int(x) if x.is_integer() else x)
 
     tokensymbols["lotsize"] = df["lLotSize"]
-    tokensymbols["tick_size"] = df["dTickSize"]
+    tokensymbols["tick_size"] = pd.to_numeric(df["dTickSize"], errors="coerce") / 100
     tokensymbols["brsymbol"] = df["pTrdSymbol"]
     tokensymbols["brexchange"] = df["pExchSeg"]
     tokensymbols["exchange"] = "CDS"
@@ -483,7 +484,7 @@ def process_kotak_mcx_csv(path):
     tokensymbols["strike"] = tokensymbols["strike"].apply(lambda x: int(x) if x.is_integer() else x)
 
     tokensymbols["lotsize"] = df["lLotSize"]
-    tokensymbols["tick_size"] = df["dTickSize"]
+    tokensymbols["tick_size"] = pd.to_numeric(df["dTickSize"], errors="coerce") / 100
     tokensymbols["brsymbol"] = df["pTrdSymbol"]
     tokensymbols["brexchange"] = df["pExchSeg"]
     tokensymbols["exchange"] = "MCX"
@@ -522,7 +523,7 @@ def process_kotak_bfo_csv(path):
     tokensymbols["strike"] = tokensymbols["strike"].apply(lambda x: int(x) if x.is_integer() else x)
 
     tokensymbols["lotsize"] = df["lLotSize"]
-    tokensymbols["tick_size"] = df["dTickSize"]
+    tokensymbols["tick_size"] = pd.to_numeric(df["dTickSize"], errors="coerce") / 100
     tokensymbols["brsymbol"] = df["pTrdSymbol"]
     tokensymbols["brexchange"] = df["pExchSeg"]
     tokensymbols["exchange"] = "BFO"

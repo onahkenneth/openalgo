@@ -1,5 +1,5 @@
 import { Activity, Briefcase, Calendar, Download, Package, Settings } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -13,7 +13,8 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { cn } from '@/lib/utils'
+import { cn, makeFormatCurrency } from '@/lib/utils'
+import { useAuthStore } from '@/stores/authStore'
 
 interface DailyPnL {
   date: string
@@ -76,13 +77,6 @@ interface SandboxData {
   trades: Trade[]
 }
 
-function formatCurrency(value: number): string {
-  return new Intl.NumberFormat('en-IN', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(value)
-}
-
 function getPnLColor(value: number): string {
   if (value > 0) return 'text-green-500'
   if (value < 0) return 'text-red-500'
@@ -90,13 +84,15 @@ function getPnLColor(value: number): string {
 }
 
 export default function SandboxPnL() {
+  const { user } = useAuthStore()
+  const formatCurrency = useMemo(() => makeFormatCurrency(user?.broker), [user?.broker])
   const [data, setData] = useState<SandboxData | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [activeTab, setActiveTab] = useState('daily')
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: one-time data load on mount; fetchData has no reactive inputs
   useEffect(() => {
     fetchData()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const fetchData = async () => {
@@ -110,7 +106,7 @@ export default function SandboxPnL() {
           setData(result.data)
         }
       }
-    } catch (error) {
+    } catch (_error) {
     } finally {
       setIsLoading(false)
     }

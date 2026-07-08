@@ -1,12 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Check, ChevronsUpDown } from 'lucide-react'
 import type * as PlotlyTypes from 'plotly.js'
-import { useThemeStore } from '@/stores/themeStore'
-import {
-  oiProfileApi,
-  type OIProfileDataResponse,
-  type CandleData,
-} from '@/api/oi-profile'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type CandleData, type OIProfileDataResponse, oiProfileApi } from '@/api/oi-profile'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import {
   Command,
@@ -24,20 +21,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
+import { useSupportedExchanges } from '@/hooks/useSupportedExchanges'
+import Plot from '@/lib/Plot2D'
+import { useThemeStore } from '@/stores/themeStore'
 import { showToast } from '@/utils/toast'
-import Plot from 'react-plotly.js'
 
-const FNO_EXCHANGES = [
-  { value: 'NFO', label: 'NFO' },
-  { value: 'BFO', label: 'BFO' },
-]
-
-const DEFAULT_UNDERLYINGS: Record<string, string[]> = {
-  NFO: ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'],
-  BFO: ['SENSEX', 'BANKEX'],
-}
+// FNO_EXCHANGES and DEFAULT_UNDERLYINGS are now provided by useSupportedExchanges() hook
 
 const INTERVAL_DAYS: Record<string, number> = {
   '1m': 1,
@@ -84,13 +73,18 @@ function formatCandleTime(candle: CandleData): string {
 
 export default function OIProfile() {
   const { mode, appMode } = useThemeStore()
+  const { fnoExchanges, defaultFnoExchange, defaultUnderlyings } = useSupportedExchanges()
   const isAnalyzer = appMode === 'analyzer'
   const isDark = mode === 'dark' || isAnalyzer
 
-  const [selectedExchange, setSelectedExchange] = useState('NFO')
-  const [underlyings, setUnderlyings] = useState<string[]>(DEFAULT_UNDERLYINGS.NFO)
+  const [selectedExchange, setSelectedExchange] = useState(defaultFnoExchange)
+  const [underlyings, setUnderlyings] = useState<string[]>(
+    defaultUnderlyings[defaultFnoExchange] || []
+  )
   const [underlyingOpen, setUnderlyingOpen] = useState(false)
-  const [selectedUnderlying, setSelectedUnderlying] = useState('NIFTY')
+  const [selectedUnderlying, setSelectedUnderlying] = useState(
+    defaultUnderlyings[defaultFnoExchange]?.[0] || ''
+  )
   const [expiries, setExpiries] = useState<string[]>([])
   const [selectedExpiry, setSelectedExpiry] = useState('')
   const [intervals, setIntervals] = useState<string[]>(['5m'])
@@ -99,7 +93,15 @@ export default function OIProfile() {
   const [isLoading, setIsLoading] = useState(false)
   const requestIdRef = useRef(0)
 
+  // Re-sync exchange when broker capabilities load asynchronously
+  useEffect(() => {
+    setSelectedExchange((prev) =>
+      prev && fnoExchanges.some((ex) => ex.value === prev) ? prev : defaultFnoExchange
+    )
+  }, [defaultFnoExchange, fnoExchanges])
+
   // Fetch supported intervals on mount
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intervals are fetched once on mount; selectedInterval is only read to validate the initial default, not to re-trigger the fetch
   useEffect(() => {
     const fetchIntervals = async () => {
       try {
@@ -115,12 +117,11 @@ export default function OIProfile() {
       }
     }
     fetchIntervals()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Fetch underlyings when exchange changes
   useEffect(() => {
-    const defaults = DEFAULT_UNDERLYINGS[selectedExchange] || []
+    const defaults = defaultUnderlyings[selectedExchange] || []
     setUnderlyings(defaults)
     setSelectedUnderlying(defaults[0] || '')
     setExpiries([])
@@ -146,7 +147,7 @@ export default function OIProfile() {
     return () => {
       cancelled = true
     }
-  }, [selectedExchange])
+  }, [selectedExchange, defaultUnderlyings[selectedExchange]])
 
   // Fetch expiries when underlying changes
   useEffect(() => {
@@ -177,8 +178,7 @@ export default function OIProfile() {
     return () => {
       cancelled = true
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedUnderlying])
+  }, [selectedUnderlying, selectedExchange])
 
   // Fetch profile data
   const fetchProfileData = useCallback(async () => {
@@ -213,8 +213,7 @@ export default function OIProfile() {
     if (selectedExpiry) {
       fetchProfileData()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedExpiry, selectedInterval])
+  }, [selectedExpiry, fetchProfileData])
 
   // Theme colors
   const themeColors = useMemo(
@@ -232,17 +231,9 @@ export default function OIProfile() {
       ceChange: '#86efac',
       peChange: '#fca5a5',
       atmLine: '#eab308',
-      hoverBg: isDark
-        ? isAnalyzer
-          ? '#2d2545'
-          : '#1e293b'
-        : '#ffffff',
+      hoverBg: isDark ? (isAnalyzer ? '#2d2545' : '#1e293b') : '#ffffff',
       hoverFont: isDark ? '#e0e0e0' : '#333333',
-      hoverBorder: isDark
-        ? isAnalyzer
-          ? '#7c3aed'
-          : '#475569'
-        : '#e2e8f0',
+      hoverBorder: isDark ? (isAnalyzer ? '#7c3aed' : '#475569') : '#e2e8f0',
       increasing: '#22c55e',
       decreasing: '#ef4444',
     }),
@@ -268,8 +259,7 @@ export default function OIProfile() {
 
   // Build the 3-column plot
   const profilePlot = useMemo(() => {
-    if (!profileData?.oi_chain || !profileData.candles?.length)
-      return { data: [], layout: {} }
+    if (!profileData?.oi_chain || !profileData.candles?.length) return { data: [], layout: {} }
 
     const candles = profileData.candles
     const oiChain = profileData.oi_chain
@@ -485,7 +475,7 @@ export default function OIProfile() {
               <SelectValue placeholder="Exchange" />
             </SelectTrigger>
             <SelectContent>
-              {FNO_EXCHANGES.map((ex) => (
+              {fnoExchanges.map((ex) => (
                 <SelectItem key={ex.value} value={ex.value}>
                   {ex.label}
                 </SelectItem>
@@ -496,7 +486,12 @@ export default function OIProfile() {
           {/* Underlying */}
           <Popover open={underlyingOpen} onOpenChange={setUnderlyingOpen}>
             <PopoverTrigger asChild>
-              <Button variant="outline" role="combobox" aria-expanded={underlyingOpen} className="w-[160px] justify-between">
+              <Button
+                variant="outline"
+                role="combobox"
+                aria-expanded={underlyingOpen}
+                className="w-[160px] justify-between"
+              >
                 {selectedUnderlying || 'Underlying'}
                 <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
               </Button>
@@ -516,7 +511,9 @@ export default function OIProfile() {
                           setUnderlyingOpen(false)
                         }}
                       >
-                        <Check className={`mr-2 h-4 w-4 ${selectedUnderlying === u ? 'opacity-100' : 'opacity-0'}`} />
+                        <Check
+                          className={`mr-2 h-4 w-4 ${selectedUnderlying === u ? 'opacity-100' : 'opacity-0'}`}
+                        />
                         {u}
                       </CommandItem>
                     ))}

@@ -7,6 +7,7 @@ import {
   RefreshCw,
   TrendingDown,
   TrendingUp,
+  Wallet,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { tradingApi } from '@/api/trading'
@@ -23,27 +24,23 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { useLivePrice, calculateLiveStats } from '@/hooks/useLivePrice'
+import { calculateLiveStats, useLivePrice } from '@/hooks/useLivePrice'
+import { useOrderEventRefresh } from '@/hooks/useOrderEventRefresh'
 import { usePageVisibility } from '@/hooks/usePageVisibility'
-import { cn, sanitizeCSV } from '@/lib/utils'
+import { cn, makeFormatCurrency, sanitizeCSV } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
 import { onModeChange } from '@/stores/themeStore'
 import type { Holding, HoldingsStats } from '@/types/trading'
-
-function formatCurrency(value: number): string {
-  return new Intl.NumberFormat('en-IN', {
-    style: 'currency',
-    currency: 'INR',
-    minimumFractionDigits: 2,
-  }).format(value)
-}
+import { showToast } from '@/utils/toast'
+import { EmptyState } from '@/components/ui/empty-state'
 
 function formatPercent(value: number): string {
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`
 }
 
 export default function Holdings() {
-  const { apiKey } = useAuthStore()
+  const { apiKey, user } = useAuthStore()
+  const formatCurrency = useMemo(() => makeFormatCurrency(user?.broker), [user?.broker])
   const [holdings, setHoldings] = useState<Holding[]>([])
   const [stats, setStats] = useState<HoldingsStats | null>(null)
   const [isLoading, setIsLoading] = useState(true)
@@ -57,7 +54,11 @@ export default function Holdings() {
 
   // Centralized real-time price hook with WebSocket + MultiQuotes fallback
   // Automatically pauses when tab is hidden
-  const { data: enhancedHoldings, isLive, isPaused } = useLivePrice(holdings, {
+  const {
+    data: enhancedHoldings,
+    isLive,
+    isPaused,
+  } = useLivePrice(holdings, {
     enabled: holdings.length > 0,
     useMultiQuotesFallback: true,
     staleThreshold: 5000,
@@ -117,16 +118,12 @@ export default function Holdings() {
 
     fetchHoldings()
     lastFetchRef.current = Date.now()
+  }, [fetchHoldings, isVisible])
 
-    // Reduce polling interval when live (WebSocket connected AND market open)
-    const intervalMs = isLive ? 30000 : 10000
-    const interval = setInterval(() => {
-      fetchHoldings()
-      lastFetchRef.current = Date.now()
-    }, intervalMs)
-
-    return () => clearInterval(interval)
-  }, [fetchHoldings, isLive, isVisible])
+  // Refresh on order events instead of polling
+  useOrderEventRefresh(fetchHoldings, {
+    events: ['order_event', 'analyzer_update'],
+  })
 
   // Refresh data when tab becomes visible after being hidden
   useEffect(() => {
@@ -139,12 +136,15 @@ export default function Holdings() {
       setShowStaleWarning(true)
       fetchHoldings()
       lastFetchRef.current = Date.now()
-
-      // Hide the warning after 5 seconds
-      const timeout = setTimeout(() => setShowStaleWarning(false), 5000)
-      return () => clearTimeout(timeout)
     }
   }, [wasHidden, isVisible, timeSinceHidden, fetchHoldings])
+
+  // Auto-dismiss stale data warning after 5 seconds
+  useEffect(() => {
+    if (!showStaleWarning) return
+    const timeout = setTimeout(() => setShowStaleWarning(false), 5000)
+    return () => clearTimeout(timeout)
+  }, [showStaleWarning])
 
   // Listen for mode changes (live/analyze) and refresh data
   useEffect(() => {
@@ -155,36 +155,47 @@ export default function Holdings() {
   }, [fetchHoldings])
 
   const exportToCSV = () => {
-    const headers = [
-      'Symbol',
-      'Exchange',
-      'Quantity',
-      'Avg Price',
-      'LTP',
-      'Product',
-      'P&L',
-      'P&L %',
-    ]
-    const rows = enhancedHoldings.map((h) => [
-      sanitizeCSV(h.symbol),
-      sanitizeCSV(h.exchange),
-      sanitizeCSV(h.quantity),
-      sanitizeCSV(h.average_price),
-      sanitizeCSV(h.ltp),
-      sanitizeCSV(h.product),
-      sanitizeCSV(h.pnl),
-      sanitizeCSV(h.pnlpercent),
-    ])
+    if (enhancedHoldings.length === 0) {
+      showToast.error('No data to export', 'system')
+      return
+    }
 
-    const csv = [headers, ...rows].map((row) => row.join(',')).join('\n')
-    const blob = new Blob([csv], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `holdings_${new Date().toISOString().split('T')[0]}.csv`
-    a.click()
-    // Revoke the object URL to free memory
-    URL.revokeObjectURL(url)
+    try {
+      const headers = [
+        'Symbol',
+        'Exchange',
+        'Quantity',
+        'Avg Price',
+        'LTP',
+        'Product',
+        'P&L',
+        'P&L %',
+      ]
+      const rows = enhancedHoldings.map((h) => [
+        sanitizeCSV(h.symbol),
+        sanitizeCSV(h.exchange),
+        sanitizeCSV(h.quantity),
+        sanitizeCSV(h.average_price),
+        sanitizeCSV(h.ltp),
+        sanitizeCSV(h.product),
+        sanitizeCSV(h.pnl),
+        sanitizeCSV(h.pnlpercent),
+      ])
+
+      const csv = [headers, ...rows].map((row) => row.join(',')).join('\n')
+      const blob = new Blob([csv], { type: 'text/csv' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      const filename = `holdings_${new Date().toISOString().split('T')[0]}.csv`
+      a.download = filename
+      a.click()
+      // Revoke the object URL to free memory
+      URL.revokeObjectURL(url)
+      showToast.success(`Downloaded ${filename}`, 'clipboard')
+    } catch {
+      showToast.error('Failed to export CSV', 'system')
+    }
   }
 
   const isProfit = (value: number) => value >= 0
@@ -306,7 +317,7 @@ export default function Holdings() {
 
       {/* Holdings Table */}
       <Card>
-        <CardContent className="p-0">
+        <CardContent className="py-0">
           {isLoading ? (
             <div className="flex items-center justify-center py-12">
               <Loader2 className="h-8 w-8 animate-spin" />
@@ -314,7 +325,11 @@ export default function Holdings() {
           ) : error ? (
             <div className="text-center py-12 text-muted-foreground">{error}</div>
           ) : holdings.length === 0 ? (
-            <div className="text-center py-12 text-muted-foreground">No holdings found</div>
+            <EmptyState
+              icon={Wallet}
+              title="No holdings found"
+              description="Connect a broker to start tracking your portfolio."
+            />
           ) : (
             <div className="overflow-x-auto">
               <Table>

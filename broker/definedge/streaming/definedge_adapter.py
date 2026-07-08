@@ -7,7 +7,12 @@ import time
 from typing import Any, Dict, List, Optional
 
 from broker.definedge.streaming.definedge_websocket import DefinedGeWebSocket
-from database.auth_db import get_auth_token, get_feed_token
+from database.auth_db import (
+    decrypt_token,
+    get_auth_token,
+    get_feed_token,
+    get_feed_token_dbquery,
+)
 from database.token_db import get_token
 
 # Add parent directory to path to allow imports
@@ -110,11 +115,11 @@ class MarketDataCache:
             data.get(f) and not self._is_zero_value(data.get(f)) for f in ["o", "h", "l", "c"]
         )
         if has_ohlc:
-            self.logger.info(
-                f"📸 OHLC snapshot cached for {token}: o={data.get('o')}, h={data.get('h')}, l={data.get('l')}, c={data.get('c')}"
+            self.logger.debug(
+                f"OHLC snapshot cached for {token}: o={data.get('o')}, h={data.get('h')}, l={data.get('l')}, c={data.get('c')}"
             )
 
-        self.logger.info(
+        self.logger.debug(
             f"Initializing cache for token {token} - "
             f"{present_fields}/{len(basic_fields)} fields present ({completeness:.1%})"
         )
@@ -159,7 +164,7 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Get tokens from database if not provided (following Angel pattern)
         if not auth_data:
             # Fetch authentication tokens from database
-            auth_token = get_auth_token(user_id)
+            auth_token = get_auth_token(user_id, bypass_cache=True)
             feed_token = get_feed_token(user_id)  # This contains susertoken for DefinEdge
 
             if not auth_token:
@@ -189,8 +194,18 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 "actid": definedge_uid,  # Same as uid for DefinEdge
             }
 
-        # Create DefinedGeWebSocket instance with auth data
-        self.ws_client = DefinedGeWebSocket(auth_data)
+        # Remember uid/actid so we can rebuild fresh auth_data on reconnect.
+        # uid/actid do not roll over; only the auth_token/feed_token do.
+        self._uid = auth_data.get("uid", "")
+        self._actid = auth_data.get("actid", "")
+
+        # Create DefinedGeWebSocket instance with auth data.
+        # Pass a token_provider so the client can re-read a fresh token from
+        # the DB before each reconnect (DefinEdge tokens roll over daily at
+        # ~3 AM IST; reusing the construction-time token reconnects dead).
+        self.ws_client = DefinedGeWebSocket(
+            auth_data, token_provider=self._fetch_fresh_auth_data
+        )
 
         # Set callbacks
         self.ws_client.on_connect = self._on_open
@@ -200,6 +215,41 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.ws_client.on_disconnect = self._on_close
 
         self.running = True
+
+    def _fetch_fresh_auth_data(self) -> dict[str, Any] | None:
+        """Re-read fresh auth tokens from the database for reconnection.
+
+        Returns a fresh auth_data dict (same shape used in initialize) so the
+        WebSocket client can authenticate with the current day's token after
+        the ~3 AM IST rollover. Returns None if no user_id or token available.
+        """
+        if not self.user_id:
+            return None
+        try:
+            auth_token = get_auth_token(self.user_id, bypass_cache=True)
+            # Direct DB read (get_feed_token has no bypass_cache param) so the
+            # susertoken is fresh after the ~3 AM IST rollover regardless of
+            # cross-process cache-invalidation timing.
+            feed_obj = get_feed_token_dbquery(self.user_id)
+            feed_token = (
+                decrypt_token(feed_obj.feed_token)
+                if feed_obj and feed_obj.feed_token
+                else None
+            )
+            if not auth_token:
+                self.logger.warning(
+                    "Could not fetch fresh auth token on reconnect; using existing token"
+                )
+                return None
+            return {
+                "auth_token": auth_token,
+                "feed_token": feed_token,
+                "uid": self._uid,
+                "actid": self._actid,
+            }
+        except Exception as e:
+            self.logger.error(f"Error fetching fresh auth data on reconnect: {e}")
+            return None
 
     def connect(self) -> None:
         """Establish connection to DefinEdge WebSocket"""
@@ -221,6 +271,10 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.logger.info(
                     f"Connecting to DefinEdge WebSocket (attempt {self.reconnect_attempts + 1})"
                 )
+                # On retry attempts, re-read a fresh token from the DB before
+                # connecting so a daily token rollover does not leave us dead.
+                if self.reconnect_attempts > 0 and self.ws_client:
+                    self.ws_client._refresh_tokens()
                 if self.ws_client and self.ws_client.connect():
                     self.reconnect_attempts = 0  # Reset attempts on successful connection
                     self.connected = True
@@ -617,7 +671,7 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 # This is subscription acknowledgement with initial OHLC snapshot
                 token = message.get("tk")
                 exchange = message.get("e")
-                self.logger.info(f"📸 Touchline ACK for {exchange}|{token} - Initial snapshot")
+                self.logger.debug(f"Touchline ACK for {exchange}|{token} - Initial snapshot")
 
                 # Check and log OHLC values in acknowledgment
                 ohlc_values = {
@@ -631,13 +685,13 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 has_nonzero_ohlc = any(v not in [None, "", "0", 0] for v in ohlc_values.values())
 
                 if has_nonzero_ohlc:
-                    self.logger.info(
-                        f"✅ OHLC snapshot received: Open={ohlc_values['open']}, High={ohlc_values['high']}, Low={ohlc_values['low']}, Close={ohlc_values['close']}"
+                    self.logger.debug(
+                        f"OHLC snapshot received: Open={ohlc_values['open']}, High={ohlc_values['high']}, Low={ohlc_values['low']}, Close={ohlc_values['close']}"
                     )
                     # Mark this as initial snapshot for cache
                     message["_is_snapshot"] = True
                 else:
-                    self.logger.warning("⚠️ No OHLC in touchline ACK (market may be closed)")
+                    self.logger.warning("No OHLC in touchline ACK (market may be closed)")
 
                 # Always process acknowledgment as it contains initial snapshot
                 # Continue processing - don't return
@@ -736,8 +790,8 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
                             # Log if we're providing OHLC from depth
                             if any(market_data.get(f) for f in ["open", "high", "low", "close"]):
-                                self.logger.info(
-                                    f"✓ Providing OHLC to Quote mode from Depth data for {symbol}"
+                                self.logger.debug(
+                                    f"Providing OHLC to Quote mode from Depth data for {symbol}"
                                 )
 
                             self.publish_market_data(topic, quote_data)
@@ -758,8 +812,8 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 )
                 # Check if acknowledgment contains initial OHLC data
                 if any(message.get(f) for f in ["o", "h", "l", "c"]):
-                    self.logger.info(
-                        f"✓ Depth ACK has OHLC: o={message.get('o')}, h={message.get('h')}, l={message.get('l')}, c={message.get('c')}"
+                    self.logger.debug(
+                        f"Depth ACK has OHLC: o={message.get('o')}, h={message.get('h')}, l={message.get('l')}, c={message.get('c')}"
                     )
                     # Process the acknowledgment as initial data
                 else:
@@ -785,11 +839,11 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                         self._depth_ohlc_logged = {}
                     self._depth_ohlc_logged[f"{exchange}|{token}"] = True
                     if has_ohlc:
-                        self.logger.info(
-                            f"✓ Depth feed has OHLC for {exchange}|{token}: {ohlc_check}"
+                        self.logger.debug(
+                            f"Depth feed has OHLC for {exchange}|{token}: {ohlc_check}"
                         )
                     else:
-                        self.logger.warning(f"✗ Depth feed has NO OHLC for {exchange}|{token}")
+                        self.logger.warning(f"Depth feed has NO OHLC for {exchange}|{token}")
 
             # Find the subscription
             subscription = None

@@ -1,6 +1,8 @@
 import json
 import os
 import urllib.parse
+import threading
+import time
 
 import httpx
 
@@ -27,7 +29,7 @@ def get_api_response(endpoint, auth_token, method="GET", payload=""):
     session_token, session_sid, base_url, access_token = auth_token.split(":::")
 
     # Debug logging for baseUrl
-    logger.info(f"ORDER API - Using baseUrl: {base_url}")
+    logger.debug(f"ORDER API - Using baseUrl: {base_url}")
 
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
@@ -45,7 +47,7 @@ def get_api_response(endpoint, auth_token, method="GET", payload=""):
     # Make request using httpx
     response = client.request(method, url, headers=headers, content=payload if payload else None)
 
-    logger.info(f"ORDER API Response: {response.text}")
+    logger.debug(f"ORDER API Response: {response.text}")
 
     return json.loads(response.text)
 
@@ -66,11 +68,57 @@ def get_holdings(auth_token):
     return get_api_response("/portfolio/v1/holdings", auth_token)
 
 
+# --- Per-Symbol Smart Order Lock ---
+# Ensures only one smart order per symbol executes at a time.
+# Others queue and execute sequentially, each getting a fresh position book.
+_symbol_locks = {}          # {symbol_key: threading.Lock}
+_symbol_locks_lock = threading.Lock()
+
+# --- Position Book Cache ---
+# Caches get_positions() for 1 second. Invalidated after each smart order placement.
+_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
+_position_cache_lock = threading.Lock()
+_POSITION_CACHE_TTL = 1.0   # seconds
+
+
+def _get_symbol_lock(symbol, exchange, product):
+    """Get or create a per-symbol lock for serializing smart orders."""
+    key = f"{symbol}:{exchange}:{product}"
+    with _symbol_locks_lock:
+        if key not in _symbol_locks:
+            _symbol_locks[key] = threading.Lock()
+        return _symbol_locks[key]
+
+
+def _get_cached_positions(auth):
+    """Get positions from cache if fresh, otherwise fetch from broker API."""
+    with _position_cache_lock:
+        now = time.monotonic()
+        cached = _position_cache.get(auth)
+        if cached and (now - cached["timestamp"]) < _POSITION_CACHE_TTL:
+            return cached["data"]
+
+    # Cache miss or expired - fetch from broker
+    positions_data = get_positions(auth)
+
+    with _position_cache_lock:
+        _position_cache[auth] = {"data": positions_data, "timestamp": time.monotonic()}
+
+    return positions_data
+
+
+def _invalidate_position_cache(auth):
+    """Invalidate the position cache so the next queued order fetches fresh data."""
+    with _position_cache_lock:
+        _position_cache.pop(auth, None)
+
+
+
 def get_open_position(tradingsymbol, exchange, producttype, auth_token):
     # Convert Trading Symbol from OpenAlgo Format to Broker Format Before Search in OpenPosition
     tradingsymbol = get_br_symbol(tradingsymbol, exchange)
-    positions_data = get_positions(auth_token)
-    logger.info(f"{positions_data}")
+    positions_data = _get_cached_positions(auth_token)
+    logger.debug(f"{positions_data}")
 
     net_qty = "0"
     exchange = reverse_map_exchange(exchange)
@@ -94,7 +142,7 @@ def place_order_api(data, auth_token):
     session_token, session_sid, base_url, access_token = auth_token.split(":::")
 
     # Debug logging for baseUrl
-    logger.info(f"PLACE ORDER API - Using baseUrl: {base_url}")
+    logger.debug(f"PLACE ORDER API - Using baseUrl: {base_url}")
 
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
@@ -118,6 +166,7 @@ def place_order_api(data, auth_token):
 
     try:
         response = client.post(url, headers=headers, content=payload)
+        logger.debug(f"PLACE ORDER API Response: {response.status_code} {response.text}")
 
         # Add status attribute for compatibility with the existing codebase
         response.status = response.status_code
@@ -142,6 +191,17 @@ def place_smartorder_api(data, auth_token):
     symbol = data.get("symbol")
     exchange = data.get("exchange")
     product = data.get("product")
+
+    # Per-symbol lock: serialize smart orders per symbol
+    symbol_lock = _get_symbol_lock(symbol, exchange, product)
+
+    with symbol_lock:
+        return _place_smartorder_locked_kotak(data, auth_token, symbol, exchange, product)
+
+
+def _place_smartorder_locked_kotak(data, auth_token, symbol, exchange, product):
+    """Inner smart order logic for kotak, called under per-symbol lock."""
+    res = None
     position_size = int(data.get("position_size", "0"))
 
     # Get current open position for the symbol
@@ -149,8 +209,8 @@ def place_smartorder_api(data, auth_token):
         get_open_position(symbol, exchange, map_product_type(product), auth_token)
     )
 
-    logger.info(f"position_size : {position_size}")
-    logger.info(f"Open Position : {current_position}")
+    logger.debug(f"position_size : {position_size}")
+    logger.debug(f"Open Position : {current_position}")
 
     # Determine action based on position_size and current_position
     action = None
@@ -160,11 +220,10 @@ def place_smartorder_api(data, auth_token):
     if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
         action = data["action"]
         quantity = data["quantity"]
-        # logger.info(f"action : {action}")
-        # logger.info(f"Quantity : {quantity}")
+        # logger.debug(f"action : {action}")
+        # logger.debug(f"Quantity : {quantity}")
         res, response, orderid = place_order_api(data, auth_token)
-        # logger.info(f"{res}")
-        # logger.info(f"{response}")
+        _invalidate_position_cache(auth_token)
 
         return res, response, orderid
 
@@ -195,11 +254,11 @@ def place_smartorder_api(data, auth_token):
         if position_size > current_position:
             action = "BUY"
             quantity = position_size - current_position
-            # logger.info(f"smart buy quantity : {quantity}")
+            # logger.debug(f"smart buy quantity : {quantity}")
         elif position_size < current_position:
             action = "SELL"
             quantity = current_position - position_size
-            # logger.info(f"smart sell quantity : {quantity}")
+            # logger.debug(f"smart sell quantity : {quantity}")
 
     if action:
         # Prepare data for placing the order
@@ -207,12 +266,12 @@ def place_smartorder_api(data, auth_token):
         order_data["action"] = action
         order_data["quantity"] = str(quantity)
 
-        # logger.info(f"{order_data}")
+        # logger.debug(f"{order_data}")
         # Place the order
         res, response, orderid = place_order_api(order_data, auth_token)
-        # logger.info(f"{res}")
-        logger.info(f"{response}")
-        logger.info(f"{orderid}")
+        _invalidate_position_cache(auth_token)
+        logger.debug(f"{response}")
+        logger.debug(f"{orderid}")
 
         return res, response, orderid
 
@@ -220,7 +279,7 @@ def place_smartorder_api(data, auth_token):
 def close_all_positions(current_api_key, auth_token):
     # Fetch the current open positions
     positions_response = get_positions(auth_token)
-    # logger.info(f"{positions_response}")
+    # logger.debug(f"{positions_response}")
     # Check if the positions data is null or empty
     if positions_response["data"] is None or not positions_response["data"]:
         return {"message": "No Open Positions Found"}, 200
@@ -247,7 +306,7 @@ def close_all_positions(current_api_key, auth_token):
             # Use the get_symbol function to fetch the symbol from the database
             symbol = get_symbol(symboltoken, exchange)
 
-            logger.info(f"The Symbol is {symbol}")
+            logger.debug(f"The Symbol is {symbol}")
 
             # Prepare the order payload
             place_order_payload = {
@@ -261,14 +320,14 @@ def close_all_positions(current_api_key, auth_token):
                 "quantity": str(quantity),
             }
 
-            logger.info(f"{place_order_payload}")
+            logger.debug(f"{place_order_payload}")
 
             # Place the order to close the position
             res, response, orderid = place_order_api(place_order_payload, auth_token)
 
-            # logger.info(f"{res}")
-            logger.info(f"{response}")
-            # logger.info(f"{orderid}")
+            # logger.debug(f"{res}")
+            logger.debug(f"{response}")
+            # logger.debug(f"{orderid}")
 
             # Note: Ensure place_order_api handles any errors and logs accordingly
 
@@ -316,7 +375,7 @@ def modify_order(data, auth_token):
     session_token, session_sid, base_url, access_token = auth_token.split(":::")
 
     # Debug logging for baseUrl
-    logger.info(f"MODIFY ORDER API - Using baseUrl: {base_url}")
+    logger.debug(f"MODIFY ORDER API - Using baseUrl: {base_url}")
 
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
@@ -324,7 +383,7 @@ def modify_order(data, auth_token):
     token_id = get_token(data["symbol"], data["exchange"])
     newdata = transform_modify_order_data(data, token_id)
 
-    logger.info(f"MODIFY ORDER - Transformed data: {newdata}")
+    logger.debug(f"MODIFY ORDER - Transformed data: {newdata}")
 
     payload = f"jData={urllib.parse.quote(json.dumps(newdata))}"
 
@@ -339,13 +398,13 @@ def modify_order(data, auth_token):
     # Construct full URL
     url = f"{base_url}/quick/order/vr/modify"
 
-    logger.info(f"MODIFY ORDER - Making POST request to: {url}")
+    logger.debug(f"MODIFY ORDER - Making POST request to: {url}")
 
     try:
         response = client.post(url, headers=headers, content=payload)
 
-        logger.info(f"MODIFY ORDER - Response status: {response.status_code}")
-        logger.info(f"MODIFY ORDER - Response: {response.text}")
+        logger.debug(f"MODIFY ORDER - Response status: {response.status_code}")
+        logger.debug(f"MODIFY ORDER - Response: {response.text}")
 
         response_data = json.loads(response.text)
 
@@ -379,10 +438,10 @@ def cancel_all_orders_api(data, auth_token):
         for order in order_book_response.get("data", [])
         if order["ordSt"] in ["open", "trigger pending"]
     ]
-    # logger.info(f"{orders_to_cancel}")
+    # logger.debug(f"{orders_to_cancel}")
     canceled_orders = []
     failed_cancellations = []
-    logger.info(f"{orders_to_cancel}")
+    logger.debug(f"{orders_to_cancel}")
     # Cancel the filtered orders
     for order in orders_to_cancel:
         orderid = order["nOrdNo"]

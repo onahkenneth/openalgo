@@ -2,6 +2,8 @@ import json
 import os
 
 import httpx
+import threading
+import time
 
 from broker.flattrade.mapping.transform_data import (
     map_product_type,
@@ -25,7 +27,7 @@ def get_api_response(endpoint, auth, method="GET", payload=""):
 
     data = f'{{"uid": "{api_key}", "actid": "{api_key}"}}'
 
-    if endpoint == "/PiConnectTP/Holdings":
+    if endpoint == "/PiConnectAPI/Holdings":
         data = f'{{"uid": "{api_key}", "actid": "{api_key}", "prd": "C"}}'
 
     payload = "jData=" + data + "&jKey=" + AUTH_TOKEN
@@ -33,7 +35,7 @@ def get_api_response(endpoint, auth, method="GET", payload=""):
     # Get the shared httpx client
     client = get_httpx_client()
 
-    if endpoint == "/PiConnectTP/Holdings":
+    if endpoint == "/PiConnectAPI/Holdings":
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
     else:
         headers = {"Content-Type": "application/json"}
@@ -46,35 +48,81 @@ def get_api_response(endpoint, auth, method="GET", payload=""):
 
 
 def get_order_book(auth):
-    response = get_api_response("/PiConnectTP/OrderBook", auth, method="POST")
+    response = get_api_response("/PiConnectAPI/OrderBook", auth, method="POST")
     logger.debug(f"Flattrade OrderBook Response: {response}")
     return response
 
 
 def get_trade_book(auth):
-    response = get_api_response("/PiConnectTP/TradeBook", auth, method="POST")
+    response = get_api_response("/PiConnectAPI/TradeBook", auth, method="POST")
     logger.debug(f"Flattrade TradeBook Response: {response}")
     return response
 
 
 def get_positions(auth):
-    response = get_api_response("/PiConnectTP/PositionBook", auth, method="POST")
+    response = get_api_response("/PiConnectAPI/PositionBook", auth, method="POST")
     logger.debug(f"Flattrade PositionBook Response: {response}")
     return response
 
 
 def get_holdings(auth):
-    response = get_api_response("/PiConnectTP/Holdings", auth, method="POST")
+    response = get_api_response("/PiConnectAPI/Holdings", auth, method="POST")
     logger.debug(f"Flattrade Holdings Response: {response}")
     return response
+
+
+# --- Per-Symbol Smart Order Lock ---
+# Ensures only one smart order per symbol executes at a time.
+# Others queue and execute sequentially, each getting a fresh position book.
+_symbol_locks = {}          # {symbol_key: threading.Lock}
+_symbol_locks_lock = threading.Lock()
+
+# --- Position Book Cache ---
+# Caches get_positions() for 1 second. Invalidated after each smart order placement.
+_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
+_position_cache_lock = threading.Lock()
+_POSITION_CACHE_TTL = 1.0   # seconds
+
+
+def _get_symbol_lock(symbol, exchange, product):
+    """Get or create a per-symbol lock for serializing smart orders."""
+    key = f"{symbol}:{exchange}:{product}"
+    with _symbol_locks_lock:
+        if key not in _symbol_locks:
+            _symbol_locks[key] = threading.Lock()
+        return _symbol_locks[key]
+
+
+def _get_cached_positions(auth):
+    """Get positions from cache if fresh, otherwise fetch from broker API."""
+    with _position_cache_lock:
+        now = time.monotonic()
+        cached = _position_cache.get(auth)
+        if cached and (now - cached["timestamp"]) < _POSITION_CACHE_TTL:
+            return cached["data"]
+
+    # Cache miss or expired - fetch from broker
+    positions_data = get_positions(auth)
+
+    with _position_cache_lock:
+        _position_cache[auth] = {"data": positions_data, "timestamp": time.monotonic()}
+
+    return positions_data
+
+
+def _invalidate_position_cache(auth):
+    """Invalidate the position cache so the next queued order fetches fresh data."""
+    with _position_cache_lock:
+        _position_cache.pop(auth, None)
+
 
 
 def get_open_position(tradingsymbol, exchange, producttype, auth):
     # Convert Trading Symbol from OpenAlgo Format to Broker Format Before Search in OpenPosition
     tradingsymbol = get_br_symbol(tradingsymbol, exchange)
-    positions_data = get_positions(auth)
+    positions_data = _get_cached_positions(auth)
 
-    logger.info(f"{positions_data}")
+    logger.debug(f"{positions_data}")
 
     net_qty = "0"
 
@@ -82,7 +130,7 @@ def get_open_position(tradingsymbol, exchange, producttype, auth):
         isinstance(positions_data, dict) and (positions_data["stat"] == "Not_Ok")
     ):
         # Handle the case where there is no data
-        logger.info("No data available.")
+        logger.debug("No data available.")
         net_qty = "0"
 
     if positions_data and isinstance(positions_data, list):
@@ -110,11 +158,11 @@ def place_order_api(data, auth):
 
     payload = "jData=" + json.dumps(newdata) + "&jKey=" + AUTH_TOKEN
 
-    logger.info(f"{payload}")
+    logger.debug(f"{payload}")
     # Get the shared httpx client
     client = get_httpx_client()
 
-    url = "https://piconnect.flattrade.in/PiConnectTP/PlaceOrder"
+    url = "https://piconnect.flattrade.in/PiConnectAPI/PlaceOrder"
     res = client.post(url, content=payload, headers=headers)
     response_data = res.json()
 
@@ -138,79 +186,85 @@ def place_smartorder_api(data, auth):
     symbol = data.get("symbol")
     exchange = data.get("exchange")
     product = data.get("product")
-    position_size = int(data.get("position_size", "0"))
+    # Per-symbol lock: serialize smart orders per symbol
+    symbol_lock = _get_symbol_lock(symbol, exchange, product)
 
-    # Get current open position for the symbol
-    current_position = int(
-        get_open_position(symbol, exchange, map_product_type(product), AUTH_TOKEN)
-    )
+    with symbol_lock:
+        position_size = int(data.get("position_size", "0"))
 
-    logger.info(f"position_size : {position_size}")
-    logger.info(f"Open Position : {current_position}")
+        # Get current open position for the symbol
+        current_position = int(
+            get_open_position(symbol, exchange, map_product_type(product), AUTH_TOKEN)
+        )
 
-    # Determine action based on position_size and current_position
-    action = None
-    quantity = 0
+        logger.debug(f"position_size : {position_size}")
+        logger.debug(f"Open Position : {current_position}")
 
-    # If both position_size and current_position are 0, do nothing
-    if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
-        action = data["action"]
-        quantity = data["quantity"]
-        # logger.info(f"action : {action}")
-        # logger.info(f"Quantity : {quantity}")
-        res, response, orderid = place_order_api(data, AUTH_TOKEN)
-        # logger.info(f"{res}")
-        # logger.info(f"{response}")
+        # Determine action based on position_size and current_position
+        action = None
+        quantity = 0
 
-        return res, response, orderid
+        # If both position_size and current_position are 0, do nothing
+        if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
+            action = data["action"]
+            quantity = data["quantity"]
+            # logger.debug(f"action : {action}")
+            # logger.debug(f"Quantity : {quantity}")
+            res, response, orderid = place_order_api(data, AUTH_TOKEN)
+            _invalidate_position_cache(AUTH_TOKEN)
+            # logger.debug(f"{res}")
+            # logger.debug(f"{response}")
 
-    elif position_size == current_position:
-        if int(data["quantity"]) == 0:
-            response = {
-                "status": "success",
-                "message": "No OpenPosition Found. Not placing Exit order.",
-            }
-        else:
-            response = {
-                "status": "success",
-                "message": "No action needed. Position size matches current position",
-            }
-        orderid = None
-        return res, response, orderid  # res remains None as no API call was made
+            return res, response, orderid
 
-    if position_size == 0 and current_position > 0:
-        action = "SELL"
-        quantity = abs(current_position)
-    elif position_size == 0 and current_position < 0:
-        action = "BUY"
-        quantity = abs(current_position)
-    elif current_position == 0:
-        action = "BUY" if position_size > 0 else "SELL"
-        quantity = abs(position_size)
-    else:
-        if position_size > current_position:
-            action = "BUY"
-            quantity = position_size - current_position
-            # logger.info(f"smart buy quantity : {quantity}")
-        elif position_size < current_position:
+        elif position_size == current_position:
+            if int(data["quantity"]) == 0:
+                response = {
+                    "status": "success",
+                    "message": "No OpenPosition Found. Not placing Exit order.",
+                }
+            else:
+                response = {
+                    "status": "success",
+                    "message": "No action needed. Position size matches current position",
+                }
+            orderid = None
+            return res, response, orderid  # res remains None as no API call was made
+
+        if position_size == 0 and current_position > 0:
             action = "SELL"
-            quantity = current_position - position_size
-            # logger.info(f"smart sell quantity : {quantity}")
+            quantity = abs(current_position)
+        elif position_size == 0 and current_position < 0:
+            action = "BUY"
+            quantity = abs(current_position)
+        elif current_position == 0:
+            action = "BUY" if position_size > 0 else "SELL"
+            quantity = abs(position_size)
+        else:
+            if position_size > current_position:
+                action = "BUY"
+                quantity = position_size - current_position
+                # logger.debug(f"smart buy quantity : {quantity}")
+            elif position_size < current_position:
+                action = "SELL"
+                quantity = current_position - position_size
+                # logger.debug(f"smart sell quantity : {quantity}")
 
-    if action:
-        # Prepare data for placing the order
-        order_data = data.copy()
-        order_data["action"] = action
-        order_data["quantity"] = str(quantity)
+        if action:
+            # Prepare data for placing the order
+            order_data = data.copy()
+            order_data["action"] = action
+            order_data["quantity"] = str(quantity)
 
-        # logger.info(f"{order_data}")
-        # Place the order
-        res, response, orderid = place_order_api(order_data, auth)
-        # logger.info(f"{res}")
-        logger.info(f"{response}")
-        logger.info(f"{orderid}")
+            # logger.debug(f"{order_data}")
+            # Place the order
+            res, response, orderid = place_order_api(order_data, auth)
+            _invalidate_position_cache(AUTH_TOKEN)
+            # logger.debug(f"{res}")
+            logger.debug(f"{response}")
+            logger.debug(f"{orderid}")
 
-        return res, response, orderid
+            return res, response, orderid
 
 
 def close_all_positions(current_api_key, auth):
@@ -236,7 +290,7 @@ def close_all_positions(current_api_key, auth):
 
             # get openalgo symbol to send to placeorder function
             symbol = get_symbol(position["token"], position["exch"])
-            logger.info(f"The Symbol is {symbol}")
+            logger.debug(f"The Symbol is {symbol}")
 
             # Prepare the order payload
             place_order_payload = {
@@ -250,14 +304,14 @@ def close_all_positions(current_api_key, auth):
                 "quantity": str(quantity),
             }
 
-            logger.info(f"{place_order_payload}")
+            logger.debug(f"{place_order_payload}")
 
             # Place the order to close the position
             res, response, orderid = place_order_api(place_order_payload, auth)
 
-            # logger.info(f"{res}")
-            # logger.info(f"{response}")
-            # logger.info(f"{orderid}")
+            # logger.debug(f"{res}")
+            # logger.debug(f"{response}")
+            # logger.debug(f"{orderid}")
 
             # Note: Ensure place_order_api handles any errors and logs accordingly
 
@@ -278,10 +332,10 @@ def cancel_order(orderid, auth):
     # Get the shared httpx client and send the request
     client = get_httpx_client()
 
-    url = "https://piconnect.flattrade.in/PiConnectTP/CancelOrder"
+    url = "https://piconnect.flattrade.in/PiConnectAPI/CancelOrder"
     res = client.post(url, content=payload, headers=headers)
     data = res.json()
-    logger.info(f"{data}")
+    logger.debug(f"{data}")
 
     # Check if the request was successful
     if data.get("stat") == "Ok":
@@ -310,18 +364,18 @@ def modify_order(data, auth):
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     payload = "jData=" + json.dumps(transformed_data) + "&jKey=" + AUTH_TOKEN
 
-    logger.info(f"Modify Order Payload: {payload}")
-    logger.info(f"Modify Order Data: {transformed_data}")
+    logger.debug(f"Modify Order Payload: {payload}")
+    logger.debug(f"Modify Order Data: {transformed_data}")
 
     # Get the shared httpx client
     client = get_httpx_client()
 
-    url = "https://piconnect.flattrade.in/PiConnectTP/ModifyOrder"
+    url = "https://piconnect.flattrade.in/PiConnectAPI/ModifyOrder"
     res = client.post(url, content=payload, headers=headers)
     response = res.json()
 
-    logger.info(f"Modify Order Response: {response}")
-    logger.info(f"Modify Order Status Code: {res.status_code}")
+    logger.debug(f"Modify Order Response: {response}")
+    logger.debug(f"Modify Order Status Code: {res.status_code}")
 
     if response.get("stat") == "Ok":
         return {"status": "success", "orderid": data["orderid"]}, 200
@@ -338,7 +392,7 @@ def cancel_all_orders_api(data, auth):
     AUTH_TOKEN = auth
 
     order_book_response = get_order_book(AUTH_TOKEN)
-    # logger.info(f"{order_book_response}")
+    # logger.debug(f"{order_book_response}")
     if order_book_response is None:
         return [], []  # Return empty lists indicating failure to retrieve the order book
 
@@ -346,7 +400,7 @@ def cancel_all_orders_api(data, auth):
     orders_to_cancel = [
         order for order in order_book_response if order["status"] in ["OPEN", "TRIGGER_PENDING"]
     ]
-    # logger.info(f"{orders_to_cancel}")
+    # logger.debug(f"{orders_to_cancel}")
     canceled_orders = []
     failed_cancellations = []
 

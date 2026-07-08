@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { tradingApi, type QuotesData } from '@/api/trading'
+import { type QuotesData, tradingApi } from '@/api/trading'
 import { useMarketData } from '@/hooks/useMarketData'
 import { useMarketStatus } from '@/hooks/useMarketStatus'
 import { usePageVisibility } from '@/hooks/usePageVisibility'
@@ -16,7 +16,8 @@ export interface PriceableItem {
   pnlpercent?: number
   quantity?: number
   average_price?: number
-  today_realized_pnl?: number  // Sandbox: today's realized P&L from closed partial trades
+  today_realized_pnl?: number // Sandbox: today's realized P&L from closed partial trades
+  lot_size?: number // Contract multiplier (e.g. 0.01 for Delta Exchange ETHUSD.P)
 }
 
 /**
@@ -109,7 +110,12 @@ export function useLivePrice<T extends PriceableItem>(
   )
 
   // WebSocket market data - connect when enabled, with visibility awareness
-  const { data: marketData, isConnected: wsConnected, isPaused: wsPaused, isFallbackMode } = useMarketData({
+  const {
+    data: marketData,
+    isConnected: wsConnected,
+    isPaused: wsPaused,
+    isFallbackMode,
+  } = useMarketData({
     symbols,
     mode: 'LTP',
     enabled: enabled && items.length > 0,
@@ -166,7 +172,15 @@ export function useLivePrice<T extends PriceableItem>(
     }, multiQuotesRefreshInterval)
 
     return () => clearInterval(interval)
-  }, [enabled, items.length, useMultiQuotesFallback, fetchMultiQuotes, multiQuotesRefreshInterval, pauseWhenHidden, isVisible])
+  }, [
+    enabled,
+    items.length,
+    useMultiQuotesFallback,
+    fetchMultiQuotes,
+    multiQuotesRefreshInterval,
+    pauseWhenHidden,
+    isVisible,
+  ])
 
   // Refresh MultiQuotes immediately when tab becomes visible after being hidden
   useEffect(() => {
@@ -177,7 +191,15 @@ export function useLivePrice<T extends PriceableItem>(
       fetchMultiQuotes()
       lastFetchRef.current = Date.now()
     }
-  }, [wasHidden, isVisible, timeSinceHidden, multiQuotesRefreshInterval, useMultiQuotesFallback, enabled, fetchMultiQuotes])
+  }, [
+    wasHidden,
+    isVisible,
+    timeSinceHidden,
+    multiQuotesRefreshInterval,
+    useMultiQuotesFallback,
+    enabled,
+    fetchMultiQuotes,
+  ])
 
   /**
    * Enhance items with real-time LTP and recalculated P&L
@@ -244,14 +266,18 @@ export function useLivePrice<T extends PriceableItem>(
       const todayRealizedPnl = item.today_realized_pnl || 0
 
       if (currentLtp && avgPrice > 0) {
+        // Contract multiplier: e.g. 0.01 for Delta Exchange ETHUSD.P (1 lot = 0.01 ETH)
+        // Defaults to 1 for all standard brokers where qty is already in underlying units
+        const lotSize = item.lot_size ?? 1
+
         // Calculate unrealized P&L based on position direction
         // Long (qty > 0): profit when ltp > avgPrice
         // Short (qty < 0): profit when ltp < avgPrice
         let unrealizedPnl: number
         if (qty > 0) {
-          unrealizedPnl = (currentLtp - avgPrice) * qty
+          unrealizedPnl = (currentLtp - avgPrice) * qty * lotSize
         } else {
-          unrealizedPnl = (avgPrice - currentLtp) * Math.abs(qty)
+          unrealizedPnl = (avgPrice - currentLtp) * Math.abs(qty) * lotSize
         }
 
         // Total P&L = today's realized (from partial closes) + current unrealized

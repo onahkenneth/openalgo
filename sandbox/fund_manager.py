@@ -35,30 +35,19 @@ from database.sandbox_db import (
 )
 from database.token_db import get_symbol_info
 from utils.logging import get_logger
+from utils.symbol_utils import is_future, is_option
 
 logger = get_logger(__name__)
 
 
-def is_option(symbol, exchange):
-    """Check if symbol is an option based on exchange and symbol suffix"""
-    if exchange in ["NFO", "BFO", "MCX", "CDS", "BCD", "NCDEX"]:
-        return symbol.endswith("CE") or symbol.endswith("PE")
-    return False
-
-
-def is_future(symbol, exchange):
-    """Check if symbol is a future based on exchange and symbol suffix"""
-    if exchange in ["NFO", "BFO", "MCX", "CDS", "BCD", "NCDEX"]:
-        return symbol.endswith("FUT")
-    return False
-
-
 class FundManager:
-    """Manages virtual funds for sandbox mode"""
+    """Manages sandbox funds for sandbox mode"""
 
-    # Class-level lock for thread safety across all fund operations
-    # This prevents race conditions when multiple threads modify funds simultaneously
-    _lock = threading.Lock()
+    # Class-level lock for thread safety across all fund operations.
+    # RLock (reentrant) is required because guarded methods call
+    # _ensure_funds_initialized() -> initialize_funds(), which re-acquires
+    # the same lock on the same thread.
+    _lock = threading.RLock()
 
     def __init__(self, user_id):
         self.user_id = user_id
@@ -201,10 +190,26 @@ class FundManager:
                 db_session.rollback()
                 logger.exception(f"Error resetting funds for user {self.user_id}: {e}")
 
+    def _ensure_funds_initialized(self):
+        """Ensure funds are initialized for the user, creating them if needed.
+
+        Returns:
+            SandboxFunds or None: The funds record, or None if initialization failed.
+        """
+        funds = SandboxFunds.query.filter_by(user_id=self.user_id).first()
+        if not funds:
+            logger.info(f"Auto-initializing funds for user {self.user_id}")
+            success, message = self.initialize_funds()
+            if not success:
+                logger.error(f"Failed to auto-initialize funds for user {self.user_id}: {message}")
+                return None
+            funds = SandboxFunds.query.filter_by(user_id=self.user_id).first()
+        return funds
+
     def check_margin_available(self, required_margin):
         """Check if user has sufficient margin available"""
         try:
-            funds = SandboxFunds.query.filter_by(user_id=self.user_id).first()
+            funds = self._ensure_funds_initialized()
 
             if not funds:
                 return False, "Funds not initialized"
@@ -228,7 +233,7 @@ class FundManager:
         """Block margin for a trade"""
         with self._lock:
             try:
-                funds = SandboxFunds.query.filter_by(user_id=self.user_id).first()
+                funds = self._ensure_funds_initialized()
 
                 if not funds:
                     return False, "Funds not initialized"
@@ -259,7 +264,7 @@ class FundManager:
         """Release blocked margin and update P&L"""
         with self._lock:
             try:
-                funds = SandboxFunds.query.filter_by(user_id=self.user_id).first()
+                funds = self._ensure_funds_initialized()
 
                 if not funds:
                     return False, "Funds not initialized"
@@ -300,7 +305,7 @@ class FundManager:
         """
         with self._lock:
             try:
-                funds = SandboxFunds.query.filter_by(user_id=self.user_id).first()
+                funds = self._ensure_funds_initialized()
 
                 if not funds:
                     return False, "Funds not initialized"
@@ -330,7 +335,7 @@ class FundManager:
         """
         with self._lock:
             try:
-                funds = SandboxFunds.query.filter_by(user_id=self.user_id).first()
+                funds = self._ensure_funds_initialized()
 
                 if not funds:
                     return False, "Funds not initialized"
@@ -356,7 +361,7 @@ class FundManager:
         """Update unrealized P&L from open positions"""
         with self._lock:
             try:
-                funds = SandboxFunds.query.filter_by(user_id=self.user_id).first()
+                funds = self._ensure_funds_initialized()
 
                 if not funds:
                     return False, "Funds not initialized"

@@ -34,6 +34,7 @@ class TradejiniWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.running = False
         self.lock = threading.Lock()
         self.ws_url = None
+        self._connect_thread = None
 
     def initialize(
         self, broker_name: str, user_id: str, auth_data: dict[str, str] | None = None
@@ -56,7 +57,7 @@ class TradejiniWebSocketAdapter(BaseBrokerWebSocketAdapter):
         if not auth_data:
             # Fetch authentication tokens from database
             # For Tradejini, the access token is used for both API and WebSocket
-            auth_token = get_auth_token(user_id)
+            auth_token = get_auth_token(user_id, bypass_cache=True)
 
             if not auth_token:
                 self.logger.error(f"No authentication token found for user {user_id}")
@@ -111,7 +112,8 @@ class TradejiniWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.logger.error("WebSocket client not initialized. Call initialize() first.")
             return
 
-        threading.Thread(target=self._connect_with_retry, daemon=True).start()
+        self._connect_thread = threading.Thread(target=self._connect_with_retry, daemon=True)
+        self._connect_thread.start()
 
     def _connect_with_retry(self) -> None:
         """Connect to Tradejini WebSocket with retry logic"""
@@ -120,6 +122,25 @@ class TradejiniWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.logger.info(
                     f"Connecting to Tradejini WebSocket (attempt {self.reconnect_attempts + 1})"
                 )
+
+                # Re-read a fresh auth token from the database before connecting.
+                # Indian broker tokens roll over daily at ~3 AM IST, so a reconnect after
+                # rollover must not reuse the construction-time token. NxtradStream bakes
+                # this token into the connection URL, so it must be refreshed here. Apply
+                # the same (api_key:access_token) formatting that initialize() uses.
+                fresh_token = get_auth_token(self.user_id, bypass_cache=True)
+                if fresh_token:
+                    api_key = os.getenv("BROKER_API_SECRET", "")
+                    if api_key and ":" not in fresh_token:
+                        self.ws_token = f"{api_key}:{fresh_token}"
+                    else:
+                        self.ws_token = fresh_token
+                else:
+                    self.logger.warning(
+                        "Could not fetch fresh auth token from database; "
+                        "reusing existing token for reconnection"
+                    )
+
                 self.ws_client.connect(self.ws_token)
                 self.reconnect_attempts = 0  # Reset attempts on successful connection
                 break
@@ -338,7 +359,8 @@ class TradejiniWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
             # Attempt to reconnect if we're still running
             if self.running:
-                threading.Thread(target=self._connect_with_retry, daemon=True).start()
+                self._connect_thread = threading.Thread(target=self._connect_with_retry, daemon=True)
+                self._connect_thread.start()
 
     def _on_data(self, ws, message) -> None:
         """Callback for market data from the WebSocket"""

@@ -1,10 +1,12 @@
 import json
 import os
+import threading
 import time
 
 import httpx
 
 from broker.nubra.mapping.transform_data import (
+    _market_protection_pct,
     map_product_type,
     reverse_map_product_type,
     transform_data,
@@ -24,6 +26,22 @@ NUBRA_BASE_URL = "https://api.nubra.io"
 # Trading APIs: 10 ops/sec (PROD), 100 ops/sec (UAT)
 _MAX_RETRIES = 3
 _RATE_LIMIT_BASE_DELAY = 1.0  # Base delay for 429 retry (seconds)
+
+
+class _StubResponse:
+    """Minimal response stand-in for paths that fail before any HTTP call.
+
+    The service layer only reads ``.status`` (and occasionally ``.text``), so we
+    mimic an httpx response without performing a request.
+    """
+
+    def __init__(self, status_code, text=""):
+        self.status_code = status_code
+        self.status = status_code
+        self.text = text
+
+    def json(self):
+        return {}
 
 
 def get_api_response(endpoint, auth, method="GET", payload=""):
@@ -80,10 +98,59 @@ def get_api_response(endpoint, auth, method="GET", payload=""):
         return {}
 
 
+def _compute_mpp_price_paise(symbol, exchange, action, auth):
+    """
+    Compute the Market-Protection-Price (MPP, in paise) for a MARKET order.
+
+    Nubra does not support price_type=MARKET and has no broker-side
+    market-protection flag, so an OpenAlgo MARKET order is emulated the way
+    Zerodha's market_protection / Arrow's mpp works: a DAY LIMIT priced at the
+    LTP offset by the protection band:
+      - BUY  -> LTP * (1 + band)   (upper protection price)
+      - SELL -> LTP * (1 - band)   (lower protection price)
+    The order rests as a DAY limit (NOT IOC). The band is NUBRA_MARKET_PROTECTION_PCT
+    (percent, default 1.0).
+
+    Returns:
+        int price in paise, or None if no price context could be obtained
+        (the caller must then refuse to place the order rather than send price 0).
+    """
+    token = get_token(symbol, exchange)
+    if not token or not str(token).isdigit():
+        logger.warning(f"Nubra MPP emulation: no numeric ref_id for {symbol} on {exchange}")
+        return None
+
+    try:
+        resp = get_api_response(f"/orderbooks/{token}?levels=1", auth)
+    except Exception as e:
+        logger.warning(f"Nubra MPP emulation: order book fetch failed for {symbol}: {e}")
+        return None
+
+    orderbook = resp.get("orderBook") or {} if isinstance(resp, dict) else {}
+    side = action.upper()
+
+    # Reference price = LTP; fall back to the best opposite quote if LTP missing
+    ref_price = int(orderbook.get("ltp", 0) or 0)
+    if not ref_price:
+        if side == "BUY":
+            asks = [int(a.get("p", 0) or 0) for a in (orderbook.get("ask") or []) if a.get("p")]
+            ref_price = asks[0] if asks else 0
+        else:
+            bids = [int(b.get("p", 0) or 0) for b in (orderbook.get("bid") or []) if b.get("p")]
+            ref_price = bids[0] if bids else 0
+
+    if not ref_price:
+        logger.warning(f"Nubra MPP emulation: no LTP/quote for {symbol} on {exchange}")
+        return None
+
+    band = _market_protection_pct()
+    return int(round(ref_price * (1 + band))) if side == "BUY" else int(round(ref_price * (1 - band)))
+
+
 def get_order_book(auth):
     """
     Fetch all orders for the day from Nubra API.
-    
+
     Nubra API: GET /orders/v2
     Returns list of orders with their current status.
     """
@@ -110,7 +177,7 @@ def get_positions(auth):
     Returns list of positions with fields like ref_id, ref_data, quantity, etc.
     """
     response = get_api_response("/portfolio/positions", auth)
-    logger.info(f"Nubra Raw position book response: {response}")
+    logger.debug(f"Nubra Raw position book response: {response}")
     return response
 
 
@@ -125,6 +192,52 @@ def get_holdings(auth):
     return get_api_response("/portfolio/holdings", auth)
 
 
+# --- Per-Symbol Smart Order Lock ---
+# Ensures only one smart order per symbol executes at a time.
+# Others queue and execute sequentially, each getting a fresh position book.
+_symbol_locks = {}          # {symbol_key: threading.Lock}
+_symbol_locks_lock = threading.Lock()
+
+# --- Position Book Cache ---
+# Caches get_positions() for 1 second. Invalidated after each smart order placement.
+_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
+_position_cache_lock = threading.Lock()
+_POSITION_CACHE_TTL = 1.0   # seconds
+
+
+def _get_symbol_lock(symbol, exchange, product):
+    """Get or create a per-symbol lock for serializing smart orders."""
+    key = f"{symbol}:{exchange}:{product}"
+    with _symbol_locks_lock:
+        if key not in _symbol_locks:
+            _symbol_locks[key] = threading.Lock()
+        return _symbol_locks[key]
+
+
+def _get_cached_positions(auth):
+    """Get positions from cache if fresh, otherwise fetch from broker API."""
+    with _position_cache_lock:
+        now = time.monotonic()
+        cached = _position_cache.get(auth)
+        if cached and (now - cached["timestamp"]) < _POSITION_CACHE_TTL:
+            return cached["data"]
+
+    # Cache miss or expired - fetch from broker
+    positions_data = get_positions(auth)
+
+    with _position_cache_lock:
+        _position_cache[auth] = {"data": positions_data, "timestamp": time.monotonic()}
+
+    return positions_data
+
+
+def _invalidate_position_cache(auth):
+    """Invalidate the position cache so the next queued order fetches fresh data."""
+    with _position_cache_lock:
+        _position_cache.pop(auth, None)
+
+
+
 def get_open_position(tradingsymbol, exchange, producttype, auth):
     """
     Get the net quantity for a specific position.
@@ -132,7 +245,7 @@ def get_open_position(tradingsymbol, exchange, producttype, auth):
     """
     # Convert Trading Symbol from OpenAlgo Format to Broker Format Before Search in OpenPosition
     tradingsymbol = get_br_symbol(tradingsymbol, exchange)
-    positions_data = get_positions(auth)
+    positions_data = _get_cached_positions(auth)
 
     logger.debug(f"Nubra positions data: {positions_data}")
 
@@ -194,11 +307,44 @@ def place_order_api(data, auth):
     
     # Get token (ref_id) for the symbol
     token = get_token(data["symbol"], data["exchange"])
-    
-    logger.info(f"Nubra order - Symbol: {data['symbol']}, Exchange: {data['exchange']}, Token: {token}")
-    
+
+    logger.debug(f"Nubra order - Symbol: {data['symbol']}, Exchange: {data['exchange']}, Token: {token}")
+
+    pricetype = data.get("pricetype", "MARKET").upper()
+
+    # Stop orders (SL / SL-M) require a trigger price. SL-M is a stop-MARKET that
+    # Nubra has no native type for, so it is emulated as a stop-LIMIT priced at
+    # the trigger +/- the protection band (see transform_data) - which is
+    # impossible without a trigger. Fail fast with a clear message.
+    if pricetype in ("SL", "SL-M"):
+        try:
+            trigger = float(data.get("trigger_price", 0) or 0)
+        except (TypeError, ValueError):
+            trigger = 0
+        if not trigger:
+            msg = f"{pricetype} order requires a non-zero trigger_price for {data['symbol']} on {data['exchange']}."
+            logger.error(msg)
+            return _StubResponse(400), {"status": False, "error": msg}, None
+
+    # MARKET emulation: Nubra is limit-only, so derive the Market-Protection-Price
+    # (LTP +/- band) and send it as a DAY limit (MPP style, no IOC).
+    market_price_paise = None
+    if pricetype == "MARKET":
+        market_price_paise = _compute_mpp_price_paise(
+            data["symbol"], data["exchange"], data["action"], AUTH_TOKEN
+        )
+        if not market_price_paise:
+            msg = (
+                f"Could not determine a market price to emulate a MARKET order for "
+                f"{data['symbol']} on {data['exchange']} (Nubra is limit-only). "
+                f"Place a LIMIT order or retry when quotes are available."
+            )
+            logger.error(msg)
+            response_data = {"status": False, "error": msg}
+            return _StubResponse(400), response_data, None
+
     # Transform OpenAlgo data to Nubra format
-    nubra_data = transform_data(data, token)
+    nubra_data = transform_data(data, token, market_price_paise=market_price_paise)
     
     headers = {
         "Authorization": f"Bearer {AUTH_TOKEN}",
@@ -209,7 +355,7 @@ def place_order_api(data, auth):
     
     payload = json.dumps(nubra_data)
     
-    logger.info(f"Nubra place order payload: {payload}")
+    logger.debug(f"Nubra place order payload: {payload}")
 
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
@@ -246,7 +392,7 @@ def place_order_api(data, auth):
         response_data = {"error": "Failed to parse response"}
         return response, response_data, None
 
-    logger.info(f"Nubra place order response (status={response.status_code}): {response_data}")
+    logger.debug(f"Nubra place order response (status={response.status_code}): {response_data}")
 
     # Nubra returns 201 (Created) on success with order_id in response
     if response.status_code in [200, 201] and "order_id" in response_data:
@@ -274,79 +420,85 @@ def place_smartorder_api(data, auth):
     symbol = data.get("symbol")
     exchange = data.get("exchange")
     product = data.get("product")
-    position_size = int(data.get("position_size", "0"))
+    # Per-symbol lock: serialize smart orders per symbol
+    symbol_lock = _get_symbol_lock(symbol, exchange, product)
 
-    # Get current open position for the symbol
-    current_position = int(
-        get_open_position(symbol, exchange, product, AUTH_TOKEN)
-    )
+    with symbol_lock:
+        position_size = int(data.get("position_size", "0"))
 
-    logger.info(f"position_size : {position_size}")
-    logger.info(f"Open Position : {current_position}")
+        # Get current open position for the symbol
+        current_position = int(
+            get_open_position(symbol, exchange, product, AUTH_TOKEN)
+        )
 
-    # Determine action based on position_size and current_position
-    action = None
-    quantity = 0
+        logger.debug(f"position_size : {position_size}")
+        logger.debug(f"Open Position : {current_position}")
 
-    # If both position_size and current_position are 0, do nothing
-    if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
-        action = data["action"]
-        quantity = data["quantity"]
-        # logger.info(f"action : {action}")
-        # logger.info(f"Quantity : {quantity}")
-        res, response, orderid = place_order_api(data, AUTH_TOKEN)
-        # logger.info(f"{res}")
-        # logger.info(f"{response}")
+        # Determine action based on position_size and current_position
+        action = None
+        quantity = 0
 
-        return res, response, orderid
+        # If both position_size and current_position are 0, do nothing
+        if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
+            action = data["action"]
+            quantity = data["quantity"]
+            # logger.debug(f"action : {action}")
+            # logger.debug(f"Quantity : {quantity}")
+            res, response, orderid = place_order_api(data, AUTH_TOKEN)
+            _invalidate_position_cache(AUTH_TOKEN)
+            # logger.debug(f"{res}")
+            # logger.debug(f"{response}")
 
-    elif position_size == current_position:
-        if int(data["quantity"]) == 0:
-            response = {
-                "status": "success",
-                "message": "No OpenPosition Found. Not placing Exit order.",
-            }
-        else:
-            response = {
-                "status": "success",
-                "message": "No action needed. Position size matches current position",
-            }
-        orderid = None
-        return res, response, orderid  # res remains None as no API call was mad
+            return res, response, orderid
 
-    if position_size == 0 and current_position > 0:
-        action = "SELL"
-        quantity = abs(current_position)
-    elif position_size == 0 and current_position < 0:
-        action = "BUY"
-        quantity = abs(current_position)
-    elif current_position == 0:
-        action = "BUY" if position_size > 0 else "SELL"
-        quantity = abs(position_size)
-    else:
-        if position_size > current_position:
-            action = "BUY"
-            quantity = position_size - current_position
-            # logger.info(f"smart buy quantity : {quantity}")
-        elif position_size < current_position:
+        elif position_size == current_position:
+            if int(data["quantity"]) == 0:
+                response = {
+                    "status": "success",
+                    "message": "No OpenPosition Found. Not placing Exit order.",
+                }
+            else:
+                response = {
+                    "status": "success",
+                    "message": "No action needed. Position size matches current position",
+                }
+            orderid = None
+            return res, response, orderid  # res remains None as no API call was mad
+
+        if position_size == 0 and current_position > 0:
             action = "SELL"
-            quantity = current_position - position_size
-            # logger.info(f"smart sell quantity : {quantity}")
+            quantity = abs(current_position)
+        elif position_size == 0 and current_position < 0:
+            action = "BUY"
+            quantity = abs(current_position)
+        elif current_position == 0:
+            action = "BUY" if position_size > 0 else "SELL"
+            quantity = abs(position_size)
+        else:
+            if position_size > current_position:
+                action = "BUY"
+                quantity = position_size - current_position
+                # logger.debug(f"smart buy quantity : {quantity}")
+            elif position_size < current_position:
+                action = "SELL"
+                quantity = current_position - position_size
+                # logger.debug(f"smart sell quantity : {quantity}")
 
-    if action:
-        # Prepare data for placing the order
-        order_data = data.copy()
-        order_data["action"] = action
-        order_data["quantity"] = str(quantity)
+        if action:
+            # Prepare data for placing the order
+            order_data = data.copy()
+            order_data["action"] = action
+            order_data["quantity"] = str(quantity)
 
-        # logger.info(f"{order_data}")
-        # Place the order
-        res, response, orderid = place_order_api(order_data, auth)
-        # logger.info(f"{res}")
-        logger.info(f"{response}")
-        logger.info(f"{orderid}")
+            # logger.debug(f"{order_data}")
+            # Place the order
+            res, response, orderid = place_order_api(order_data, auth)
+            _invalidate_position_cache(AUTH_TOKEN)
+            # logger.debug(f"{res}")
+            logger.debug(f"{response}")
+            logger.debug(f"{orderid}")
 
-        return res, response, orderid
+            return res, response, orderid
 
 
 def close_all_positions(current_api_key, auth):
@@ -360,7 +512,7 @@ def close_all_positions(current_api_key, auth):
 
     positions_response = get_positions(AUTH_TOKEN)
     
-    logger.info(f"Nubra positions response: {positions_response}")
+    logger.debug(f"Nubra positions response: {positions_response}")
 
     # Handle Nubra's response format - portfolio contains stock_positions, fut_positions, opt_positions
     positions = []
@@ -412,7 +564,7 @@ def close_all_positions(current_api_key, auth):
         if oa_symbol:
             symbol = oa_symbol
         
-        logger.info(f"Closing position - Symbol: {symbol}, Exchange: {exchange}, Qty: {quantity}, Action: {action}")
+        logger.debug(f"Closing position - Symbol: {symbol}, Exchange: {exchange}, Qty: {quantity}, Action: {action}")
 
         # Map product type - Nubra uses 'product' like ORDER_DELIVERY_TYPE_CNC
         product_type = position.get("product", "ORDER_DELIVERY_TYPE_IDAY")
@@ -430,13 +582,13 @@ def close_all_positions(current_api_key, auth):
             "quantity": str(quantity),
         }
 
-        logger.info(f"Close position payload: {place_order_payload}")
+        logger.debug(f"Close position payload: {place_order_payload}")
 
         # Place the order to close the position
         res, response, orderid = place_order_api(place_order_payload, auth)
         positions_closed += 1
 
-        logger.info(f"Close position response: {response}, orderid: {orderid}")
+        logger.debug(f"Close position response: {response}, orderid: {orderid}")
 
         # Rate limit: 10 ops/sec = 100ms gap between requests
         time.sleep(0.1)
@@ -501,7 +653,7 @@ def cancel_order(orderid, auth):
         logger.error(f"Failed to parse cancel order response: {response.text}")
         return {"status": "error", "message": "Failed to parse response"}, response.status_code
 
-    logger.info(f"Nubra cancel order response (status={response.status_code}): {data}")
+    logger.debug(f"Nubra cancel order response (status={response.status_code}): {data}")
 
     # Check if the request was successful
     # Nubra returns {"message": "delete request pushed"} on success
@@ -536,10 +688,17 @@ def modify_order(data, auth):
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
 
+    # MARKET emulation on modify: derive the Market-Protection-Price (DAY limit, MPP style)
+    market_price_paise = None
+    if data.get("pricetype", "MARKET").upper() == "MARKET" and data.get("symbol") and data.get("exchange"):
+        market_price_paise = _compute_mpp_price_paise(
+            data["symbol"], data["exchange"], data.get("action", "BUY"), AUTH_TOKEN
+        )
+
     # Transform OpenAlgo data to Nubra modify order format
     # Note: token/ref_id is not needed for modify order
-    transformed_data = transform_modify_order_data(data, None)
-    
+    transformed_data = transform_modify_order_data(data, None, market_price_paise=market_price_paise)
+
     # Get order_id from the data
     orderid = data.get("orderid", "")
     
@@ -552,7 +711,7 @@ def modify_order(data, auth):
     }
     payload = json.dumps(transformed_data)
     
-    logger.info(f"Nubra modify order payload: {payload}")
+    logger.debug(f"Nubra modify order payload: {payload}")
 
     # Make the POST request with 429 retry
     response = None
@@ -592,7 +751,7 @@ def modify_order(data, auth):
         logger.error(f"Failed to parse modify order response: {response.text}")
         return {"status": "error", "message": "Failed to parse response"}, response.status_code
 
-    logger.info(f"Nubra modify order response (status={response.status_code}): {response_data}")
+    logger.debug(f"Nubra modify order response (status={response.status_code}): {response_data}")
 
     # Check if the request was successful
     # Nubra returns {"message": "update request pushed"} on success
@@ -620,7 +779,7 @@ def cancel_all_orders_api(data, auth):
     AUTH_TOKEN = auth
 
     order_book_response = get_order_book(AUTH_TOKEN)
-    # logger.info(f"{order_book_response}")
+    # logger.debug(f"{order_book_response}")
     
     # Nubra returns a list directly, or could return error dict
     if isinstance(order_book_response, dict):
@@ -635,12 +794,14 @@ def cancel_all_orders_api(data, auth):
     if not orders:
         return [], []
 
-    # Filter orders that are in 'open' or 'pending' state
-    # Nubra uses ORDER_STATUS_OPEN, ORDER_STATUS_PENDING
+    # Filter orders that are still cancellable (not filled/cancelled/rejected).
+    # Per Nubra's OrderStatus enum the working states are PENDING, SENT, OPEN and
+    # TRIGGERED (there is no ORDER_STATUS_TRIGGER_PENDING).
     open_statuses = [
-        "ORDER_STATUS_OPEN", 
+        "ORDER_STATUS_OPEN",
         "ORDER_STATUS_PENDING",
-        "ORDER_STATUS_TRIGGER_PENDING",
+        "ORDER_STATUS_SENT",
+        "ORDER_STATUS_TRIGGERED",
     ]
     
     orders_to_cancel = [
@@ -648,7 +809,7 @@ def cancel_all_orders_api(data, auth):
         for order in orders
         if order.get("order_status") in open_statuses
     ]
-    # logger.info(f"{orders_to_cancel}")
+    # logger.debug(f"{orders_to_cancel}")
     canceled_orders = []
     failed_cancellations = []
 

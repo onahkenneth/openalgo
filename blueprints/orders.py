@@ -13,7 +13,6 @@ from services.holdings_service import get_holdings
 from services.orderbook_service import get_orderbook
 from services.place_smart_order_service import place_smart_order
 from services.positionbook_service import get_positionbook
-from services.telegram_alert_service import telegram_alert_service
 from services.tradebook_service import get_tradebook
 from utils.logging import get_logger
 from utils.session import check_session_validity
@@ -605,18 +604,27 @@ def close_position():
             }
             status_code = 200
 
-            # Send Telegram alert for individual position close
+            # Publish event for logging, socketio, and telegram (fixes missing API log)
             api_key = get_api_key_for_tradingview(login_username)
             if api_key:
-                from extensions import socketio
+                from events import PositionClosedEvent
+                from utils.event_bus import bus
 
-                socketio.start_background_task(
-                    telegram_alert_service.send_order_alert,
-                    "closeposition",
-                    order_data,
-                    response_data,
-                    api_key,
-                )
+                log_request = order_data.copy()
+                log_request["api_type"] = "closeposition"
+
+                bus.publish(PositionClosedEvent(
+                    mode="live",
+                    api_type="closeposition",
+                    symbol=symbol,
+                    exchange=exchange,
+                    product=product,
+                    orderid=str(orderid),
+                    message="Position close order placed successfully.",
+                    request_data=log_request,
+                    response_data=response_data,
+                    api_key=api_key,
+                ))
         else:
             # No orderid, definite error
             response_data = {
@@ -778,6 +786,101 @@ def cancel_order_ui():
 
     except Exception as e:
         logger.exception(f"Error in cancel_order_ui endpoint: {str(e)}")
+        return jsonify({"status": "error", "message": f"An error occurred: {str(e)}"}), 500
+
+
+@orders_bp.route("/modify_gtt_order", methods=["POST"])
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def modify_gtt_order_ui():
+    """Modify an active GTT trigger from the UI (session-auth).
+
+    Accepts the flat replacement body — same shape as PlaceGTTOrder plus
+    ``trigger_id``. ``last_price`` is fetched server-side by the broker.
+    """
+    try:
+        login_username = session["user"]
+        auth_token = get_auth_token(login_username)
+        broker_name = session.get("broker")
+
+        if not auth_token or not broker_name:
+            return jsonify({"status": "error", "message": "Authentication error"}), 401
+
+        data = request.get_json() or {}
+        trigger_id = data.get("trigger_id")
+        if not trigger_id:
+            return jsonify({"status": "error", "message": "trigger_id is required"}), 400
+
+        from services.modify_gtt_order_service import modify_gtt_order
+
+        api_key = None
+        if get_analyze_mode():
+            api_key = get_api_key_for_tradingview(login_username)
+
+        order_data = {
+            "trigger_id": str(trigger_id),
+            "strategy": data.get("strategy", "GTT Modify"),
+            "symbol": data.get("symbol"),
+            "exchange": data.get("exchange"),
+            "trigger_type": data.get("trigger_type"),
+            "action": data.get("action"),
+            "product": data.get("product"),
+            "quantity": data.get("quantity"),
+            "pricetype": data.get("pricetype", "LIMIT"),
+            "price": data.get("price"),
+            "triggerprice_sl": data.get("triggerprice_sl"),
+            "triggerprice_tg": data.get("triggerprice_tg"),
+            "stoploss": data.get("stoploss"),
+            "target": data.get("target"),
+        }
+
+        success, response_data, status_code = modify_gtt_order(
+            order_data=order_data,
+            api_key=api_key,
+            auth_token=auth_token,
+            broker=broker_name,
+        )
+        return jsonify(response_data), status_code
+
+    except Exception as e:
+        logger.exception(f"Error in modify_gtt_order_ui endpoint: {str(e)}")
+        return jsonify({"status": "error", "message": f"An error occurred: {str(e)}"}), 500
+
+
+@orders_bp.route("/cancel_gtt_order", methods=["POST"])
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def cancel_gtt_order_ui():
+    """Cancel a GTT trigger using the broker API from UI (session-auth)."""
+    try:
+        login_username = session["user"]
+        auth_token = get_auth_token(login_username)
+        broker_name = session.get("broker")
+
+        if not auth_token or not broker_name:
+            return jsonify({"status": "error", "message": "Authentication error"}), 401
+
+        data = request.get_json() or {}
+        trigger_id = data.get("trigger_id")
+        if not trigger_id:
+            return jsonify({"status": "error", "message": "trigger_id is required"}), 400
+
+        from services.cancel_gtt_order_service import cancel_gtt_order
+
+        api_key = None
+        if get_analyze_mode():
+            api_key = get_api_key_for_tradingview(login_username)
+
+        success, response_data, status_code = cancel_gtt_order(
+            trigger_id=str(trigger_id),
+            api_key=api_key,
+            auth_token=auth_token,
+            broker=broker_name,
+        )
+        return jsonify(response_data), status_code
+
+    except Exception as e:
+        logger.exception(f"Error in cancel_gtt_order_ui endpoint: {str(e)}")
         return jsonify({"status": "error", "message": f"An error occurred: {str(e)}"}), 500
 
 

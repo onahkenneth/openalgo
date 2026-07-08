@@ -16,8 +16,6 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { io, type Socket } from 'socket.io-client'
 import { webClient } from '@/api/client'
-import { useAlertStore } from '@/stores/alertStore'
-import { showToast } from '@/utils/toast'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -42,6 +40,8 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { useAlertStore } from '@/stores/alertStore'
+import { showToast } from '@/utils/toast'
 
 interface PendingOrder {
   id: number
@@ -121,7 +121,7 @@ export default function ActionCenterPage() {
           }
         )
       }
-    } catch (error) {
+    } catch (_error) {
       showToast.error('Failed to load action center data', 'actionCenter')
     } finally {
       setIsLoading(false)
@@ -131,12 +131,7 @@ export default function ActionCenterPage() {
 
   useEffect(() => {
     fetchData()
-    // Auto-refresh every 30 seconds for pending orders
-    if (activeFilter === 'pending') {
-      const interval = setInterval(fetchData, 30000)
-      return () => clearInterval(interval)
-    }
-  }, [fetchData, activeFilter])
+  }, [fetchData])
 
   // Socket connection for realtime order updates
   useEffect(() => {
@@ -571,6 +566,11 @@ export default function ActionCenterPage() {
                               variant="ghost"
                               className="h-8 w-8"
                               onClick={() => toggleExpanded(order.id)}
+                              aria-label={
+                                expandedOrders.has(order.id)
+                                  ? 'Collapse order details'
+                                  : 'Expand order details'
+                              }
                             >
                               {expandedOrders.has(order.id) ? (
                                 <ChevronUp className="h-4 w-4" />

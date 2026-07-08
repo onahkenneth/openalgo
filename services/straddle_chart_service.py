@@ -15,13 +15,20 @@ import pytz
 
 from services.history_service import get_history
 from services.option_greeks_service import parse_option_symbol
+from services.strategy_chart_service import (
+    _cap_last_n_trading_dates,
+    _resolve_trading_window,
+)
 from services.option_symbol_service import (
+    construct_crypto_option_symbol,
     construct_option_symbol,
     find_atm_strike_from_actual,
     get_available_strikes,
     get_option_exchange,
 )
+from database.token_db_enhanced import fno_search_symbols
 from services.quotes_service import get_quotes
+from utils.constants import CRYPTO_EXCHANGES, INSTRUMENT_PERPFUT
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -49,6 +56,9 @@ def _get_quote_exchange(base_symbol, underlying_exchange):
         return "BSE_INDEX"
     if underlying_exchange.upper() in ("NFO", "BFO"):
         return "NSE" if underlying_exchange.upper() == "NFO" else "BSE"
+    # Crypto options — underlying is on the same exchange
+    if underlying_exchange.upper() in CRYPTO_EXCHANGES:
+        return underlying_exchange.upper()
     return underlying_exchange.upper()
 
 
@@ -117,20 +127,29 @@ def get_straddle_chart_data(
     """
     try:
         ist = pytz.timezone("Asia/Kolkata")
-        today = datetime.now(ist).date()
-        # Skip weekends
-        weekday = today.weekday()
-        if weekday == 5:  # Saturday
-            today = today - timedelta(days=1)
-        elif weekday == 6:  # Sunday
-            today = today - timedelta(days=2)
-        end_date_str = today.strftime("%Y-%m-%d")
-        start_date_str = (today - timedelta(days=max(1, days) - 1)).strftime("%Y-%m-%d")
+        # Generous calendar window; the returned series is post-filtered to
+        # the last N distinct trading dates that actually have data. Works
+        # even at 02:16 IST when today has no candles yet.
+        start_date_str, end_date_str = _resolve_trading_window(days, ist)
 
         # Step 1: Determine exchanges
         base_symbol = underlying.upper()
         quote_exchange = _get_quote_exchange(base_symbol, exchange)
         options_exchange = get_option_exchange(quote_exchange)
+        # CRYPTO: look up the canonical perpetual symbol from cache (e.g. BTC → BTCUSDFUT)
+        if exchange.upper() in CRYPTO_EXCHANGES:
+            _perp = fno_search_symbols(
+                query=f"{base_symbol}USDFUT", exchange=exchange, instrumenttype=INSTRUMENT_PERPFUT, limit=1
+            )
+            if not _perp:
+                return (
+                    False,
+                    {"status": "error", "message": f"No perpetual futures found for {base_symbol} on {exchange}"},
+                    404,
+                )
+            underlying_quote_symbol = _perp[0]["symbol"]
+        else:
+            underlying_quote_symbol = base_symbol
 
         # Step 2: Get available strikes for the expiry
         available_strikes = get_available_strikes(
@@ -148,7 +167,7 @@ def get_straddle_chart_data(
 
         # Step 3: Fetch underlying history
         success_u, resp_u, _ = get_history(
-            symbol=base_symbol,
+            symbol=underlying_quote_symbol,
             exchange=quote_exchange,
             interval=interval,
             start_date=start_date_str,
@@ -193,9 +212,10 @@ def get_straddle_chart_data(
         # Build lookup: {strike: {timestamp: {ce_close, pe_close}}}
         strike_data = {}
 
+        _build_sym = construct_crypto_option_symbol if exchange.upper() in CRYPTO_EXCHANGES else construct_option_symbol
         for strike in sorted(unique_strikes):
-            ce_symbol = construct_option_symbol(base_symbol, expiry_date.upper(), strike, "CE")
-            pe_symbol = construct_option_symbol(base_symbol, expiry_date.upper(), strike, "PE")
+            ce_symbol = _build_sym(base_symbol, expiry_date.upper(), strike, "CE")
+            pe_symbol = _build_sym(base_symbol, expiry_date.upper(), strike, "PE")
 
             # Fetch CE history
             success_ce, resp_ce, _ = get_history(
@@ -279,9 +299,15 @@ def get_straddle_chart_data(
                 404,
             )
 
+        # Trim to the last N distinct trading dates that actually returned
+        # candles. Market-agnostic: counts real data, not hardcoded session
+        # times, so late-night / pre-market / holiday queries still yield
+        # exactly N days when data is available.
+        series = _cap_last_n_trading_dates(series, days, ist)
+
         # Get current LTP for display
         success_q, quote_resp, _ = get_quotes(
-            symbol=base_symbol,
+            symbol=underlying_quote_symbol,
             exchange=quote_exchange,
             api_key=api_key,
         )

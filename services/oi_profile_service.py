@@ -15,9 +15,16 @@ import time
 from datetime import datetime, timedelta
 from typing import Any
 
+import pytz
+
 from database.token_db_enhanced import fno_search_symbols
 from services.history_service import get_history
 from services.option_chain_service import get_option_chain
+from services.strategy_chart_service import (
+    _cap_last_n_trading_dates,
+    _resolve_trading_window,
+)
+from utils.constants import CRYPTO_EXCHANGES, INSTRUMENT_PERPFUT
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -47,16 +54,28 @@ def _find_futures_symbol(
         expiry_formatted = f"{expiry_date[:2]}-{expiry_date[2:5]}-{expiry_date[5:]}".upper()
 
         # Search for futures contract matching this expiry
-        futures = fno_search_symbols(
-            underlying=underlying,
-            exchange=exchange,
-            instrumenttype="FUT",
-            expiry=expiry_formatted,
-            limit=1,
-        )
+        # For crypto exchanges, perpetuals (PERPFUT) serve as the underlying
+        if exchange.upper() in CRYPTO_EXCHANGES:
+            _perp = fno_search_symbols(
+                query=f"{underlying}USDFUT", exchange=exchange, instrumenttype=INSTRUMENT_PERPFUT, limit=1
+            )
+            if not _perp:
+                return None
+            futures = [{"symbol": _perp[0]["symbol"], "exchange": _perp[0]["exchange"]}]
+        else:
+            futures = fno_search_symbols(
+                underlying=underlying,
+                exchange=exchange,
+                instrumenttype="FUT",
+                expiry=expiry_formatted,
+                limit=1,
+            )
 
         if not futures:
             # Try without expiry filter to get nearest futures
+            if exchange.upper() in CRYPTO_EXCHANGES:
+                logger.warning(f"No perpetual contracts found for {underlying} on {exchange}")
+                return None
             futures = fno_search_symbols(
                 underlying=underlying,
                 exchange=exchange,
@@ -267,8 +286,11 @@ def get_oi_profile_data(
             futures_symbol = futures_info["symbol"]
             fut_exchange = futures_info["exchange"]
 
-            end_date = datetime.now().strftime("%Y-%m-%d")
-            start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+            ist = pytz.timezone("Asia/Kolkata")
+            # Generous calendar window; post-filter the returned candles to
+            # the last N distinct trading dates with data so "3 days" stays
+            # 3 days even when queried before market open / on holidays.
+            start_date, end_date = _resolve_trading_window(days, ist)
 
             success_h, hist_response, _ = get_history(
                 symbol=futures_symbol,
@@ -281,6 +303,19 @@ def get_oi_profile_data(
 
             if success_h and hist_response.get("data"):
                 candles = hist_response["data"]
+                # Normalize each candle's timestamp key so the helper can
+                # read it — get_history returns `timestamp` in seconds/ms.
+                # The helper expects a `time` key (Unix seconds) so tag that
+                # from the existing `timestamp` column if needed.
+                for c in candles:
+                    if "time" not in c and "timestamp" in c:
+                        try:
+                            ts_val = c["timestamp"]
+                            # Heuristic: ms if > 10^12, else seconds.
+                            c["time"] = int(ts_val // 1000) if ts_val > 1e12 else int(ts_val)
+                        except (TypeError, ValueError):
+                            pass
+                candles = _cap_last_n_trading_dates(candles, days, ist)
 
         # Step 3: Fetch daily OI changes (parallel)
         prev_oi_map = _fetch_daily_oi_changes(

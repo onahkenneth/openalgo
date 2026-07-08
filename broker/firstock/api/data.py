@@ -1,7 +1,6 @@
 import json
 import os
 import time
-import traceback
 from datetime import datetime, timedelta
 
 import httpx
@@ -12,6 +11,19 @@ from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def map_firstock_exchange(exchange: str) -> str:
+    """Map OpenAlgo index exchanges to the exchange code Firstock expects.
+
+    Firstock has no separate index exchange segment: NSE indices (e.g. NIFTY)
+    are quoted under "NSE" and BSE indices (e.g. SENSEX) under "BSE".
+    """
+    if exchange == "NSE_INDEX":
+        return "NSE"
+    if exchange == "BSE_INDEX":
+        return "BSE"
+    return exchange
 
 
 def get_api_response(endpoint, auth, method="POST", payload=None, custom_timeout=None):
@@ -32,7 +44,7 @@ def get_api_response(endpoint, auth, method="POST", payload=None, custom_timeout
             data["userId"] = api_key
 
         # Debug print
-        logger.info(f"Endpoint: {endpoint}")
+        logger.debug(f"Endpoint: {endpoint}")
         logger.debug(f"Payload: {json.dumps(data, indent=2)}")
 
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -110,8 +122,7 @@ def get_api_response(endpoint, auth, method="POST", payload=None, custom_timeout
             logger.error("Connection error while calling Firstock API")
             raise Exception("Connection error - please check your internet connection")
         else:
-            logger.error(f"API Error: {e}")
-            logger.info(f"Traceback: {traceback.format_exc()}")
+            logger.exception(f"API Error: {e}")
             raise
 
 
@@ -171,8 +182,8 @@ class BrokerData:
             # Convert symbol to broker format
             br_symbol = get_br_symbol(symbol, exchange)
 
-            # Map exchange to Firstock format (NSE_INDEX -> NSE)
-            firstock_exchange = "NSE" if exchange == "NSE_INDEX" else exchange
+            # Map exchange to Firstock format (NSE_INDEX -> NSE, BSE_INDEX -> BSE)
+            firstock_exchange = map_firstock_exchange(exchange)
 
             payload = {
                 "userId": os.getenv("BROKER_API_KEY")[:-4],
@@ -285,12 +296,8 @@ class BrokerData:
                 )
                 continue
 
-            # Map exchange to Firstock format (NSE_INDEX -> NSE)
-            firstock_exchange = (
-                "NSE"
-                if exchange == "NSE_INDEX"
-                else ("BSE" if exchange == "BSE_INDEX" else exchange)
-            )
+            # Map exchange to Firstock format (NSE_INDEX -> NSE, BSE_INDEX -> BSE)
+            firstock_exchange = map_firstock_exchange(exchange)
 
             data_array.append({"exchange": firstock_exchange, "tradingSymbol": br_symbol})
 
@@ -352,8 +359,8 @@ class BrokerData:
             # Convert symbol to broker format
             br_symbol = get_br_symbol(symbol, exchange)
 
-            # Map exchange to Firstock format (NSE_INDEX -> NSE)
-            firstock_exchange = "NSE" if exchange == "NSE_INDEX" else exchange
+            # Map exchange to Firstock format (NSE_INDEX -> NSE, BSE_INDEX -> BSE)
+            firstock_exchange = map_firstock_exchange(exchange)
 
             payload = {
                 "userId": os.getenv("BROKER_API_KEY")[:-4],
@@ -578,8 +585,7 @@ class BrokerData:
             return combined_df
 
         except Exception as e:
-            logger.error(f"Error in get_history_chunked: {e}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.exception(f"Error in get_history_chunked: {e}")
             raise Exception(f"Error fetching chunked historical data: {str(e)}")
 
     def get_history_intraday_chunks(
@@ -631,7 +637,7 @@ class BrokerData:
 
             while current_date <= end_dt:
                 date_str = current_date.strftime("%d-%m-%Y")  # Firstock uses DD-MM-YYYY format
-                logger.info(f"Processing date: {date_str}")
+                logger.debug(f"Processing date: {date_str}")
 
                 # Define trading session chunks using full day to avoid hardcoded timings
                 time_chunks = [
@@ -642,7 +648,7 @@ class BrokerData:
                     try:
                         # Prepare request for this chunk
                         br_symbol = get_br_symbol(symbol, exchange)
-                        firstock_exchange = "NSE" if exchange == "NSE_INDEX" else exchange
+                        firstock_exchange = map_firstock_exchange(exchange)
 
                         payload = {
                             "userId": os.getenv("BROKER_API_KEY")[:-4],
@@ -654,7 +660,7 @@ class BrokerData:
                             "interval": "1mi",  # 1-minute interval
                         }
 
-                        logger.info(f"Fetching chunk: {start_time} to {end_time} on {date_str}")
+                        logger.debug(f"Fetching chunk: {start_time} to {end_time} on {date_str}")
 
                         # Make request with long timeout to prevent ReadTimeout errors
                         response = get_api_response(
@@ -692,7 +698,7 @@ class BrokerData:
 
                             if chunk_data:
                                 all_data.extend(chunk_data)
-                                logger.info(f"Retrieved {len(chunk_data)} candles for chunk")
+                                logger.debug(f"Retrieved {len(chunk_data)} candles for chunk")
                         else:
                             logger.warning(
                                 f"Failed to get data for chunk: {response.get('message', 'Unknown error')}"
@@ -828,7 +834,7 @@ class BrokerData:
                 chunk_end_str = current_end.strftime("%Y-%m-%d")
                 chunk_count += 1
 
-                logger.info(
+                logger.debug(
                     f"📊 Fetching chunk {chunk_count}: {chunk_start_str} to {chunk_end_str}"
                 )
 
@@ -841,7 +847,7 @@ class BrokerData:
                     if not chunk_df.empty:
                         dfs.append(chunk_df)
                         successful_chunks += 1
-                        logger.info(f"✅ Chunk {chunk_count} successful: {len(chunk_df)} records")
+                        logger.debug(f"✅ Chunk {chunk_count} successful: {len(chunk_df)} records")
                     else:
                         logger.warning(f"⚠️ Chunk {chunk_count} returned no data")
 
@@ -976,8 +982,8 @@ class BrokerData:
 
             logger.info(f"Getting {interval} data for {br_symbol} from {start_str} to {end_str}")
 
-            # Map exchange to Firstock format (NSE_INDEX -> NSE)
-            firstock_exchange = "NSE" if exchange == "NSE_INDEX" else exchange
+            # Map exchange to Firstock format (NSE_INDEX -> NSE, BSE_INDEX -> BSE)
+            firstock_exchange = map_firstock_exchange(exchange)
 
             # Prepare payload according to new API format
             payload = {
@@ -1029,7 +1035,7 @@ class BrokerData:
                     # Debug logging for daily data timestamps
                     if interval == "D":
                         debug_dt = datetime.fromtimestamp(timestamp)
-                        logger.info(f"DEBUG: Daily candle timestamp: {timestamp} -> {debug_dt}")
+                        logger.debug(f"Daily candle timestamp: {timestamp} -> {debug_dt}")
 
                     # Extract OHLCV data according to new API format
                     data.append(
@@ -1080,6 +1086,5 @@ class BrokerData:
             return df
 
         except Exception as e:
-            logger.error(f"Error in get_history: {e}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.exception(f"Error in get_history: {e}")
             raise Exception(f"Error fetching historical data: {str(e)}")

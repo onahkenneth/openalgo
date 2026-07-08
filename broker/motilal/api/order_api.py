@@ -2,6 +2,8 @@ import json
 import os
 
 import httpx
+import threading
+import time
 
 from broker.motilal.mapping.transform_data import (
     map_exchange,
@@ -94,18 +96,18 @@ def get_holdings(auth):
     # Motilal requires POST with JSON body (empty for non-dealer accounts)
     payload = json.dumps({})
 
-    logger.info("Fetching holdings from Motilal API...")
+    logger.debug("Fetching holdings from Motilal API...")
     response = get_api_response(
         "/rest/report/v1/getdpholding", auth, method="POST", payload=payload
     )
 
     # Log the raw response for debugging
-    logger.info(
+    logger.debug(
         f"Motilal Holdings API raw response: status={response.get('status')}, message={response.get('message')}, data_length={len(response.get('data', [])) if response.get('data') else 0}"
     )
 
     if response.get("status") == "SUCCESS" and response.get("data"):
-        logger.info(f"Successfully fetched {len(response.get('data', []))} holdings from Motilal")
+        logger.debug(f"Successfully fetched {len(response.get('data', []))} holdings from Motilal")
     elif response.get("status") == "SUCCESS" and not response.get("data"):
         logger.warning(
             "Motilal API returned SUCCESS but data is null/empty. This might indicate no holdings or an API issue."
@@ -118,12 +120,57 @@ def get_holdings(auth):
     return response
 
 
+# --- Per-Symbol Smart Order Lock ---
+# Ensures only one smart order per symbol executes at a time.
+# Others queue and execute sequentially, each getting a fresh position book.
+_symbol_locks = {}          # {symbol_key: threading.Lock}
+_symbol_locks_lock = threading.Lock()
+
+# --- Position Book Cache ---
+# Caches get_positions() for 1 second. Invalidated after each smart order placement.
+_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
+_position_cache_lock = threading.Lock()
+_POSITION_CACHE_TTL = 1.0   # seconds
+
+
+def _get_symbol_lock(symbol, exchange, product):
+    """Get or create a per-symbol lock for serializing smart orders."""
+    key = f"{symbol}:{exchange}:{product}"
+    with _symbol_locks_lock:
+        if key not in _symbol_locks:
+            _symbol_locks[key] = threading.Lock()
+        return _symbol_locks[key]
+
+
+def _get_cached_positions(auth):
+    """Get positions from cache if fresh, otherwise fetch from broker API."""
+    with _position_cache_lock:
+        now = time.monotonic()
+        cached = _position_cache.get(auth)
+        if cached and (now - cached["timestamp"]) < _POSITION_CACHE_TTL:
+            return cached["data"]
+
+    # Cache miss or expired - fetch from broker
+    positions_data = get_positions(auth)
+
+    with _position_cache_lock:
+        _position_cache[auth] = {"data": positions_data, "timestamp": time.monotonic()}
+
+    return positions_data
+
+
+def _invalidate_position_cache(auth):
+    """Invalidate the position cache so the next queued order fetches fresh data."""
+    with _position_cache_lock:
+        _position_cache.pop(auth, None)
+
+
 def get_open_position(tradingsymbol, exchange, producttype, auth):
     # Convert Trading Symbol from OpenAlgo Format to Broker Format Before Search in OpenPosition
     tradingsymbol = get_br_symbol(tradingsymbol, exchange)
     # Map exchange from OpenAlgo format to Motilal format for comparison
     motilal_exchange = map_exchange(exchange)
-    positions_data = get_positions(auth)
+    positions_data = _get_cached_positions(auth)
 
     logger.debug(f"{positions_data}")
 
@@ -156,7 +203,7 @@ def place_order_api(data, auth):
     data["apikey"] = BROKER_API_SECRET
     token = get_token(data["symbol"], data["exchange"])
 
-    logger.info(
+    logger.debug(
         f"Placing order for symbol: {data['symbol']}, exchange: {data['exchange']}, token: {token}"
     )
 
@@ -181,7 +228,7 @@ def place_order_api(data, auth):
         lotsize = symbol_info.lotsize
         logger.debug(f"Lot size for {data['symbol']}: {lotsize}")
 
-    newdata = transform_data(data, token)
+    newdata = transform_data(data, token, auth_token=AUTH_TOKEN)
 
     # Motilal Oswal Header Parameters
     headers = {
@@ -224,7 +271,7 @@ def place_order_api(data, auth):
         )
 
     quantity_in_lots = actual_quantity // lotsize  # Integer division to get number of lots
-    logger.info(
+    logger.debug(
         f"Quantity conversion: {actual_quantity} shares / {lotsize} lot size = {quantity_in_lots} lots"
     )
 
@@ -274,13 +321,13 @@ def place_order_api(data, auth):
     response_data = response.json()
 
     # Log the full response for debugging
-    logger.info(f"Motilal Place Order Response: {response_data}")
-    logger.info(f"Response Status Code: {response.status_code}")
+    logger.debug(f"Motilal Place Order Response: {response_data}")
+    logger.debug(f"Response Status Code: {response.status_code}")
 
     # Motilal returns status as "SUCCESS" string, not boolean
     if response_data.get("status") == "SUCCESS":
         orderid = response_data.get("uniqueorderid")
-        logger.info(f"Order placed successfully. Order ID: {orderid}")
+        logger.debug(f"Order placed successfully. Order ID: {orderid}")
     else:
         orderid = None
         logger.error(
@@ -300,79 +347,85 @@ def place_smartorder_api(data, auth):
     symbol = data.get("symbol")
     exchange = data.get("exchange")
     product = data.get("product")
-    position_size = int(data.get("position_size", "0"))
+    # Per-symbol lock: serialize smart orders per symbol
+    symbol_lock = _get_symbol_lock(symbol, exchange, product)
 
-    # Get current open position for the symbol
-    current_position = int(
-        get_open_position(symbol, exchange, map_product_type(product), AUTH_TOKEN)
-    )
+    with symbol_lock:
+        position_size = int(data.get("position_size", "0"))
 
-    logger.info(f"position_size : {position_size}")
-    logger.info(f"Open Position : {current_position}")
+        # Get current open position for the symbol
+        current_position = int(
+            get_open_position(symbol, exchange, map_product_type(product), AUTH_TOKEN)
+        )
 
-    # Determine action based on position_size and current_position
-    action = None
-    quantity = 0
+        logger.debug(f"position_size : {position_size}")
+        logger.debug(f"Open Position : {current_position}")
 
-    # If both position_size and current_position are 0, do nothing
-    if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
-        action = data["action"]
-        quantity = data["quantity"]
-        # logger.info(f"action : {action}")
-        # logger.info(f"Quantity : {quantity}")
-        res, response, orderid = place_order_api(data, AUTH_TOKEN)
-        # logger.info(f"{res}")
-        # logger.info(f"{response}")
+        # Determine action based on position_size and current_position
+        action = None
+        quantity = 0
 
-        return res, response, orderid
+        # If both position_size and current_position are 0, do nothing
+        if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
+            action = data["action"]
+            quantity = data["quantity"]
+            # logger.debug(f"action : {action}")
+            # logger.debug(f"Quantity : {quantity}")
+            res, response, orderid = place_order_api(data, AUTH_TOKEN)
+            _invalidate_position_cache(AUTH_TOKEN)
+            # logger.debug(f"{res}")
+            # logger.debug(f"{response}")
 
-    elif position_size == current_position:
-        if int(data["quantity"]) == 0:
-            response = {
-                "status": "success",
-                "message": "No OpenPosition Found. Not placing Exit order.",
-            }
-        else:
-            response = {
-                "status": "success",
-                "message": "No action needed. Position size matches current position",
-            }
-        orderid = None
-        return res, response, orderid  # res remains None as no API call was mad
+            return res, response, orderid
 
-    if position_size == 0 and current_position > 0:
-        action = "SELL"
-        quantity = abs(current_position)
-    elif position_size == 0 and current_position < 0:
-        action = "BUY"
-        quantity = abs(current_position)
-    elif current_position == 0:
-        action = "BUY" if position_size > 0 else "SELL"
-        quantity = abs(position_size)
-    else:
-        if position_size > current_position:
-            action = "BUY"
-            quantity = position_size - current_position
-            # logger.info(f"smart buy quantity : {quantity}")
-        elif position_size < current_position:
+        elif position_size == current_position:
+            if int(data["quantity"]) == 0:
+                response = {
+                    "status": "success",
+                    "message": "No OpenPosition Found. Not placing Exit order.",
+                }
+            else:
+                response = {
+                    "status": "success",
+                    "message": "No action needed. Position size matches current position",
+                }
+            orderid = None
+            return res, response, orderid  # res remains None as no API call was mad
+
+        if position_size == 0 and current_position > 0:
             action = "SELL"
-            quantity = current_position - position_size
-            # logger.info(f"smart sell quantity : {quantity}")
+            quantity = abs(current_position)
+        elif position_size == 0 and current_position < 0:
+            action = "BUY"
+            quantity = abs(current_position)
+        elif current_position == 0:
+            action = "BUY" if position_size > 0 else "SELL"
+            quantity = abs(position_size)
+        else:
+            if position_size > current_position:
+                action = "BUY"
+                quantity = position_size - current_position
+                # logger.debug(f"smart buy quantity : {quantity}")
+            elif position_size < current_position:
+                action = "SELL"
+                quantity = current_position - position_size
+                # logger.debug(f"smart sell quantity : {quantity}")
 
-    if action:
-        # Prepare data for placing the order
-        order_data = data.copy()
-        order_data["action"] = action
-        order_data["quantity"] = str(quantity)
+        if action:
+            # Prepare data for placing the order
+            order_data = data.copy()
+            order_data["action"] = action
+            order_data["quantity"] = str(quantity)
 
-        # logger.info(f"{order_data}")
-        # Place the order
-        res, response, orderid = place_order_api(order_data, auth)
-        # logger.info(f"{res}")
-        logger.info(f"{response}")
-        logger.info(f"{orderid}")
+            # logger.debug(f"{order_data}")
+            # Place the order
+            res, response, orderid = place_order_api(order_data, auth)
+            _invalidate_position_cache(AUTH_TOKEN)
+            # logger.debug(f"{res}")
+            logger.debug(f"{response}")
+            logger.debug(f"{orderid}")
 
-        return res, response, orderid
+            return res, response, orderid
 
 
 def close_all_positions(current_api_key, auth):
@@ -411,7 +464,7 @@ def close_all_positions(current_api_key, auth):
 
             # Get openalgo symbol to send to placeorder function
             symbol = get_symbol(position["symboltoken"], openalgo_exchange)
-            logger.info(f"The Symbol is {symbol}")
+            logger.debug(f"The Symbol is {symbol}")
 
             if not symbol:
                 logger.error(
@@ -431,14 +484,14 @@ def close_all_positions(current_api_key, auth):
                 "quantity": str(quantity),
             }
 
-            logger.info(f"{place_order_payload}")
+            logger.debug(f"{place_order_payload}")
 
             # Place the order to close the position
             res, response, orderid = place_order_api(place_order_payload, auth)
 
-            # logger.info(f"{res}")
-            # logger.info(f"{response}")
-            # logger.info(f"{orderid}")
+            # logger.debug(f"{res}")
+            # logger.debug(f"{response}")
+            # logger.debug(f"{orderid}")
 
             # Note: Ensure place_order_api handles any errors and logs accordingly
 
@@ -526,7 +579,7 @@ def modify_order(data, auth):
 
     # First, fetch the order details from order book to get lastmodifiedtime and qtytradedtoday
     orderid = data.get("orderid")
-    logger.info(f"Fetching order details for orderid: {orderid}")
+    logger.debug(f"Fetching order details for orderid: {orderid}")
 
     order_book_response = get_order_book(AUTH_TOKEN)
 
@@ -550,7 +603,7 @@ def modify_order(data, auth):
     lastmodifiedtime = order_details.get("lastmodifiedtime", "")
     qtytradedtoday = int(order_details.get("qtytradedtoday", 0))  # Motilal uses 'qtytradedtoday'
 
-    logger.info(
+    logger.debug(
         f"Order details: lastmodifiedtime={lastmodifiedtime}, qtytradedtoday={qtytradedtoday}"
     )
 
@@ -578,7 +631,7 @@ def modify_order(data, auth):
 
         quantity_in_lots = actual_quantity // lotsize
         data["quantity"] = str(quantity_in_lots)  # Convert to lots
-        logger.info(
+        logger.debug(
             f"Modify quantity conversion: {actual_quantity} shares / {lotsize} lot size = {quantity_in_lots} lots"
         )
 
@@ -610,7 +663,7 @@ def modify_order(data, auth):
     }
     payload = json.dumps(transformed_data)
 
-    logger.info(f"Motilal Modify Order Request Payload: {transformed_data}")
+    logger.debug(f"Motilal Modify Order Request Payload: {transformed_data}")
     logger.debug(f"Payload JSON: {payload}")
 
     # Use Production or UAT URL based on environment
@@ -627,8 +680,8 @@ def modify_order(data, auth):
     response_data = json.loads(response.text)
 
     # Log the response for debugging
-    logger.info(f"Motilal Modify Order Response: {response_data}")
-    logger.info(f"Response Status Code: {response.status_code}")
+    logger.debug(f"Motilal Modify Order Response: {response_data}")
+    logger.debug(f"Response Status Code: {response.status_code}")
 
     # Motilal returns status as "SUCCESS" string
     if response_data.get("status") == "SUCCESS":
@@ -646,7 +699,7 @@ def cancel_all_orders_api(data, auth):
     AUTH_TOKEN = auth
 
     order_book_response = get_order_book(AUTH_TOKEN)
-    # logger.info(f"{order_book_response}")
+    # logger.debug(f"{order_book_response}")
     # Motilal returns status as "SUCCESS" string
     if order_book_response.get("status") != "SUCCESS":
         return [], []  # Return empty lists indicating failure to retrieve the order book
@@ -658,7 +711,7 @@ def cancel_all_orders_api(data, auth):
         for order in order_book_response.get("data", [])
         if order.get("orderstatus", "").lower() in ["confirm", "sent", "open"]
     ]
-    # logger.info(f"{orders_to_cancel}")
+    # logger.debug(f"{orders_to_cancel}")
     canceled_orders = []
     failed_cancellations = []
 

@@ -7,8 +7,9 @@ import json
 import logging
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
-from typing import Any, Dict, Optional
+from typing import Any
 
 import websocket
 
@@ -17,20 +18,35 @@ class ShoonyaWebSocket:
     """Shoonya WebSocket client for real-time market data"""
 
     # Connection constants
-    WS_URL = "wss://api.shoonya.com/NorenWSTP/"
+    WS_URL = "wss://api.shoonya.com/NorenWSAPI/"
     CONNECTION_TIMEOUT = 15
     THREAD_JOIN_TIMEOUT = 5
 
-    # Heartbeat constants
+    # Heartbeat constants. websocket-client requires PING_INTERVAL strictly
+    # greater than PING_TIMEOUT, so they are pinned here rather than read
+    # from the platform-wide WS_PING_* env vars (which the proxy server
+    # tolerates being equal under the `websockets` library).
     HEARTBEAT_INTERVAL = 30
     HEARTBEAT_TIMEOUT = 120
     PING_INTERVAL = 30
     PING_TIMEOUT = 10
+    HEARTBEAT_JOIN_TIMEOUT = 3
 
-    # Message types
-    MSG_TYPE_CONNECT = "c"
+    # Subscription batching — Shoonya supports '#'-separated scrip lists in
+    # a single message; chunk large lists so each WS send stays small and
+    # add a small delay between chunks to avoid server-side rate limits.
+    # Empirically Shoonya tolerates much faster pacing than the original
+    # 0.5s/2.0s pair; 100ms / 500ms keeps headroom for very large bursts
+    # and is invisible to single-symbol UI clicks (which skip the delay
+    # entirely via the `if has_more` guard around the wait).
+    MAX_SCRIPS_PER_BATCH = 100
+    SUBSCRIPTION_DELAY = 0.1
+    SUBSCRIPTION_RETRY_DELAY = 0.5
+
+    # Message types (OAuth WebSocket API)
+    MSG_TYPE_CONNECT = "a"
     MSG_TYPE_HEARTBEAT = "h"
-    MSG_TYPE_AUTH_ACK = "ck"
+    MSG_TYPE_AUTH_ACK = "ak"
     MSG_TYPE_TOUCHLINE_SUB = "t"
     MSG_TYPE_TOUCHLINE_UNSUB = "u"
     MSG_TYPE_DEPTH_SUB = "d"
@@ -72,6 +88,13 @@ class ShoonyaWebSocket:
         self.running = False
         self.connected = False
 
+        # Phase 4a: distinguishes auth-failure from transient network drops so
+        # the adapter can short-circuit the reconnect loop. Set True only when
+        # the broker explicitly rejects auth (status != "OK" in the auth-ack
+        # response). Persistent across the lifetime of this WS client.
+        self.auth_failed = False
+        self.auth_failure_reason: str | None = None
+
         # Callbacks
         self.on_message = on_message
         self.on_error = on_error
@@ -83,8 +106,26 @@ class ShoonyaWebSocket:
         self._last_message_time = None
         self._heartbeat_lock = threading.Lock()
 
+        # Subscription batching — separate queues per (msg_type) since
+        # touchline/depth use different message types but share one worker.
+        self._pending_subscriptions: deque[tuple[str, str]] = deque()
+        self._subscription_thread: threading.Thread | None = None
+        self._subscription_lock = threading.Lock()
+
+        # Phase 8: shutdown event lets every wait/sleep loop bail immediately
+        # when stop() is called, instead of blocking up to N seconds. Critical
+        # under gunicorn+eventlet where systemd graceful_timeout (30s) would
+        # otherwise SIGKILL the worker mid-sleep.
+        self._shutdown_event = threading.Event()
+
         # Logging
         self.logger = logging.getLogger("shoonya_websocket")
+
+    def __del__(self):
+        try:
+            self.stop()
+        except Exception:
+            pass
 
     def connect(self) -> bool:
         """
@@ -108,6 +149,13 @@ class ShoonyaWebSocket:
     def _initialize_connection(self) -> None:
         """Initialize WebSocket connection and start thread"""
         self.running = True
+        # Phase 8: clear shutdown event so wait()s block normally on this
+        # session even if the same client object was previously stopped.
+        self._shutdown_event.clear()
+        # Phase 4a: reset stale auth-failure state if this client object is
+        # being reused for a fresh connection attempt.
+        self.auth_failed = False
+        self.auth_failure_reason = None
 
         self.ws = websocket.WebSocketApp(
             self.WS_URL,
@@ -127,13 +175,16 @@ class ShoonyaWebSocket:
         Returns:
             bool: True if connected within timeout, False otherwise
         """
+        # Phase 8: interruptible poll. Bail immediately if shutdown is signaled.
         start_time = time.time()
 
-        while time.time() - start_time < self.CONNECTION_TIMEOUT:
+        while self.running and time.time() - start_time < self.CONNECTION_TIMEOUT:
             if self.connected:
                 self.logger.info("WebSocket connected successfully")
                 return True
-            time.sleep(0.1)
+            if self._shutdown_event.wait(0.1):
+                self.logger.debug("Connection wait interrupted by shutdown")
+                return False
 
         self.logger.error("Connection timeout")
         self.stop()
@@ -151,6 +202,8 @@ class ShoonyaWebSocket:
     def _cleanup_connection_state(self) -> None:
         """Clean up connection state"""
         self.connected = False
+        with self._heartbeat_lock:
+            self._last_message_time = None
         self._stop_heartbeat()
 
     def stop(self) -> None:
@@ -160,37 +213,53 @@ class ShoonyaWebSocket:
         self.running = False
         self.connected = False
 
+        # Phase 8: signal every wait/sleep loop (heartbeat, connection-poll,
+        # subscription worker) to bail immediately instead of blocking up to
+        # HEARTBEAT_INTERVAL seconds.
+        self._shutdown_event.set()
+
+        # Drop any queued subscription batches; the worker exits when it
+        # sees running=False on its next loop iteration.
+        self.clear_pending_subscriptions()
+
         self._close_websocket()
         self._wait_for_thread_completion()
         self._stop_heartbeat()
 
     def _close_websocket(self) -> None:
-        """Close WebSocket connection"""
+        """Close WebSocket connection and null reference"""
         if self.ws:
             try:
                 self.ws.close()
             except Exception as e:
                 self.logger.error(f"Error closing WebSocket: {e}")
+            finally:
+                self.ws = None
 
+    # M3 fix: Null ws_thread after join to match _close_websocket pattern
     def _wait_for_thread_completion(self) -> None:
         """Wait for WebSocket thread to complete"""
         if self.ws_thread and self.ws_thread.is_alive():
             self.ws_thread.join(timeout=self.THREAD_JOIN_TIMEOUT)
             if self.ws_thread.is_alive():
                 self.logger.warning("WebSocket thread did not terminate within timeout")
+                return
+        self.ws_thread = None
 
     # WebSocket Event Handlers
+
     def _on_open(self, ws) -> None:
-        """Handle WebSocket connection open event"""
-        self.connected = True
+        """Handle WebSocket connection open event — wait for auth before marking connected"""
         self._update_last_message_time()
 
         self.logger.info("WebSocket connection opened, sending authentication")
 
-        if self._send_authentication():
-            self._start_heartbeat()
-            self._call_external_callback(self.on_open, ws)
+        # SW-1 fix: Don't start heartbeat here — connected is still False so
+        # the heartbeat worker loop exits immediately. Start it in
+        # _handle_auth_response after connected=True instead.
+        self._send_authentication()
 
+    # SW-4 fix: Snapshot self.ws to prevent race with _close_websocket nulling it
     def _send_authentication(self) -> bool:
         """
         Send authentication message to server
@@ -198,16 +267,21 @@ class ShoonyaWebSocket:
         Returns:
             bool: True if authentication sent successfully, False otherwise
         """
+        ws = self.ws
+        if not ws:
+            self.logger.error("Cannot send authentication: WebSocket not available")
+            return False
+
         auth_msg = {
             "t": self.MSG_TYPE_CONNECT,
             "uid": self.user_id,
             "actid": self.actid,
             "source": "API",
-            "susertoken": self.susertoken,
+            "accesstoken": self.susertoken,
         }
 
         try:
-            self.ws.send(json.dumps(auth_msg))
+            ws.send(json.dumps(auth_msg))
             self.logger.info("Authentication message sent")
             return True
         except Exception as e:
@@ -251,7 +325,7 @@ class ShoonyaWebSocket:
 
     def _handle_auth_response(self, data: dict[str, Any]) -> bool:
         """
-        Handle authentication response
+        Handle authentication response — set connected only after auth succeeds
 
         Args:
             data: Authentication response data
@@ -260,9 +334,25 @@ class ShoonyaWebSocket:
             bool: True (message handled)
         """
         if data.get("s") == self.AUTH_SUCCESS:
+            self.connected = True
             self.logger.info("Authentication successful")
+            # SW-1 fix: Start heartbeat AFTER connected=True so the worker loop runs
+            self._start_heartbeat()
+            # SA-R6-11 fix: Pass actual ws reference via snapshot to avoid race with _close_websocket
+            ws = self.ws
+            self._call_external_callback(self.on_open, ws)
         else:
             self.logger.error(f"Authentication failed: {data}")
+            # SW-5 fix: Defensively set connected=False in case future changes
+            # set it before auth completes
+            self.connected = False
+            self.running = False
+            # Phase 4a: flag this as an auth failure so the adapter can
+            # short-circuit its reconnect loop instead of hammering a dead
+            # token (e.g., 3am IST daily token expiry, weekend gap).
+            self.auth_failed = True
+            self.auth_failure_reason = str(data)
+            self._close_websocket()
 
         return True
 
@@ -299,26 +389,51 @@ class ShoonyaWebSocket:
         with self._heartbeat_lock:
             self._last_message_time = time.time()
 
+    # SW-3 fix: Read _last_message_time under lock
+    def _get_last_message_time(self) -> float | None:
+        """Get the timestamp of the last received message (thread-safe)"""
+        with self._heartbeat_lock:
+            return self._last_message_time
+
     def _start_heartbeat(self) -> None:
-        """Start heartbeat monitoring thread"""
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            return
+        """Start heartbeat monitoring thread (serialized under lock to prevent duplicates)"""
+        with self._heartbeat_lock:
+            if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+                # If the old heartbeat's loop conditions are no longer met,
+                # clear stale reference so we start a fresh thread
+                if not (self.running and self.connected):
+                    self._heartbeat_thread = None
+                else:
+                    return
 
-        self._heartbeat_thread = threading.Thread(target=self._heartbeat_worker, daemon=True)
-        self._heartbeat_thread.start()
-        self.logger.debug("Heartbeat thread started")
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_worker, daemon=True)
+            self._heartbeat_thread.start()
+            self.logger.debug("Heartbeat thread started")
 
+    # SW-2 fix: Guard against self-join when heartbeat thread calls _stop_heartbeat
+    # via _check_connection_health → _close_websocket → _on_close → _stop_heartbeat
     def _stop_heartbeat(self) -> None:
         """Stop heartbeat monitoring thread"""
-        # Thread will stop when self.running becomes False
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+        with self._heartbeat_lock:
+            thread = self._heartbeat_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
             self.logger.debug("Waiting for heartbeat thread to stop")
+            thread.join(timeout=self.THREAD_JOIN_TIMEOUT)
+            if thread.is_alive():
+                self.logger.warning("Heartbeat thread did not terminate within timeout")
+        with self._heartbeat_lock:
+            # SW-R6-2 fix: Only null if still pointing to the thread we joined,
+            # to avoid nulling a new thread started by a concurrent _start_heartbeat
+            if self._heartbeat_thread is thread:
+                self._heartbeat_thread = None
 
     def _heartbeat_worker(self) -> None:
         """Heartbeat worker thread - sends periodic heartbeats and monitors connection"""
         while self.running and self.connected:
             try:
-                time.sleep(self.HEARTBEAT_INTERVAL)
+                # Phase 8: interruptible — exit immediately on shutdown signal
+                if self._shutdown_event.wait(self.HEARTBEAT_INTERVAL):
+                    break
 
                 if self.running and self.connected:
                     if not self._send_heartbeat():
@@ -331,6 +446,7 @@ class ShoonyaWebSocket:
                 self.logger.error(f"Heartbeat worker error: {e}")
                 break
 
+    # L1 fix: Snapshot self.ws to prevent race with _close_websocket nulling it
     def _send_heartbeat(self) -> bool:
         """
         Send heartbeat message to server
@@ -338,18 +454,20 @@ class ShoonyaWebSocket:
         Returns:
             bool: True if heartbeat sent successfully, False otherwise
         """
-        if not self.ws:
+        ws = self.ws
+        if not ws:
             return False
 
         try:
             heartbeat_msg = {"t": self.MSG_TYPE_HEARTBEAT}
-            self.ws.send(json.dumps(heartbeat_msg))
+            ws.send(json.dumps(heartbeat_msg))
             self.logger.debug("Sent heartbeat")
             return True
         except Exception as e:
             self.logger.error(f"Heartbeat send error: {e}")
             return False
 
+    # M3 fix: Set flag under lock, close websocket OUTSIDE lock to avoid blocking
     def _check_connection_health(self) -> bool:
         """
         Check connection health based on last message timestamp
@@ -357,13 +475,21 @@ class ShoonyaWebSocket:
         Returns:
             bool: True if connection is healthy, False if timed out
         """
+        # M5 fix: Don't write self.running under _heartbeat_lock — it's not the
+        # lock that protects running. Set it alongside should_close outside the lock.
+        should_close = False
         with self._heartbeat_lock:
             if self._last_message_time:
                 time_since_message = time.time() - self._last_message_time
                 if time_since_message > self.HEARTBEAT_TIMEOUT:
                     self.logger.error("Connection timeout - no messages received")
-                    self._close_websocket()
-                    return False
+                    should_close = True
+
+        # SW-R6-3 fix: Merged redundant should_close checks
+        if should_close:
+            self.running = False
+            self._close_websocket()
+            return False
 
         return True
 
@@ -424,6 +550,145 @@ class ShoonyaWebSocket:
             self.MSG_TYPE_DEPTH_UNSUB, scrip_list, "depth unsubscription"
         )
 
+    # Batched subscription API — accepts a list of scrips, queues them, and
+    # drains the queue from a single worker thread that chunks large lists
+    # into MAX_SCRIPS_PER_BATCH-sized '#'-separated messages with a small
+    # SUBSCRIPTION_DELAY between sends.
+    def subscribe_touchline_scrips(self, scrips: list[str]) -> None:
+        """Queue touchline subscriptions for batched sending"""
+        self._enqueue_subscriptions(self.MSG_TYPE_TOUCHLINE_SUB, scrips)
+
+    def unsubscribe_touchline_scrips(self, scrips: list[str]) -> None:
+        """Queue touchline unsubscriptions for batched sending"""
+        self._enqueue_subscriptions(self.MSG_TYPE_TOUCHLINE_UNSUB, scrips)
+
+    def subscribe_depth_scrips(self, scrips: list[str]) -> None:
+        """Queue depth subscriptions for batched sending"""
+        self._enqueue_subscriptions(self.MSG_TYPE_DEPTH_SUB, scrips)
+
+    def unsubscribe_depth_scrips(self, scrips: list[str]) -> None:
+        """Queue depth unsubscriptions for batched sending"""
+        self._enqueue_subscriptions(self.MSG_TYPE_DEPTH_UNSUB, scrips)
+
+    def _enqueue_subscriptions(self, msg_type: str, scrips: list[str]) -> None:
+        """Append (msg_type, scrip) entries to the pending queue and ensure
+        the worker thread is running."""
+        if not scrips:
+            return
+
+        with self._subscription_lock:
+            for scrip in scrips:
+                if scrip:
+                    self._pending_subscriptions.append((msg_type, scrip))
+
+            if self._subscription_thread and self._subscription_thread.is_alive():
+                return
+
+            self._subscription_thread = threading.Thread(
+                target=self._process_pending_subscriptions,
+                daemon=True,
+                name="ShoonyaWSSubWorker",
+            )
+            self._subscription_thread.start()
+
+    def _process_pending_subscriptions(self) -> None:
+        """Drain the pending queue, grouping consecutive same-type entries
+        into batches of up to MAX_SCRIPS_PER_BATCH scrips, '#'-joined into
+        a single WS message. Sleeps SUBSCRIPTION_DELAY between batches."""
+        consecutive_failures = 0
+
+        while self.running:
+            # Wait until we have an authenticated, connected WS session
+            if not self.connected:
+                consecutive_failures += 1
+                if consecutive_failures > 6:
+                    self.logger.error(
+                        "Subscription worker giving up — no connection after retries; "
+                        "dropping pending subscription batch"
+                    )
+                    with self._subscription_lock:
+                        self._pending_subscriptions.clear()
+                    return
+                # Phase 8: interruptible wait
+                if self._shutdown_event.wait(
+                    min(self.SUBSCRIPTION_RETRY_DELAY * consecutive_failures, 10)
+                ):
+                    return
+                continue
+
+            consecutive_failures = 0
+
+            batch_msg_type: str | None = None
+            batch_scrips: list[str] = []
+
+            with self._subscription_lock:
+                if not self._pending_subscriptions:
+                    self._subscription_thread = None
+                    return
+
+                while (
+                    self._pending_subscriptions
+                    and len(batch_scrips) < self.MAX_SCRIPS_PER_BATCH
+                ):
+                    msg_type, scrip = self._pending_subscriptions[0]
+                    if batch_msg_type is None:
+                        batch_msg_type = msg_type
+                    elif msg_type != batch_msg_type:
+                        break
+                    self._pending_subscriptions.popleft()
+                    batch_scrips.append(scrip)
+
+            if not batch_scrips or batch_msg_type is None:
+                continue
+
+            scrip_list = "#".join(batch_scrips)
+            operation_name = self._operation_name_for_msg_type(batch_msg_type)
+            success = self._send_subscription_message(
+                batch_msg_type, scrip_list, operation_name
+            )
+
+            if success:
+                self.logger.info(
+                    f"Sent batch {operation_name} for {len(batch_scrips)} scrips"
+                )
+                # Pace consecutive batches so we don't flood the server
+                with self._subscription_lock:
+                    has_more = bool(self._pending_subscriptions)
+                # Phase 8: interruptible pacing
+                if has_more and self._shutdown_event.wait(self.SUBSCRIPTION_DELAY):
+                    return
+            else:
+                # Re-queue at the front and back off; preserve ordering for the
+                # rest of the queue so different msg types stay grouped.
+                # Skip re-queue if shutting down — clear_pending_subscriptions()
+                # may have already drained, and re-adding here leaks stale
+                # entries into a later reconnect/reuse of this WS client.
+                with self._subscription_lock:
+                    if self.running and not self._shutdown_event.is_set():
+                        for scrip in reversed(batch_scrips):
+                            self._pending_subscriptions.appendleft((batch_msg_type, scrip))
+                self.logger.warning(
+                    f"{operation_name} batch failed; retrying after backoff"
+                )
+                if self._shutdown_event.wait(self.SUBSCRIPTION_RETRY_DELAY):
+                    return
+
+    def _operation_name_for_msg_type(self, msg_type: str) -> str:
+        """Human-readable label for log messages."""
+        return {
+            self.MSG_TYPE_TOUCHLINE_SUB: "touchline subscription",
+            self.MSG_TYPE_TOUCHLINE_UNSUB: "touchline unsubscription",
+            self.MSG_TYPE_DEPTH_SUB: "depth subscription",
+            self.MSG_TYPE_DEPTH_UNSUB: "depth unsubscription",
+        }.get(msg_type, f"message {msg_type}")
+
+    def clear_pending_subscriptions(self) -> int:
+        """Clear any queued subscription batches. Returns the number cleared."""
+        with self._subscription_lock:
+            count = len(self._pending_subscriptions)
+            self._pending_subscriptions.clear()
+        return count
+
     def _send_subscription_message(
         self, msg_type: str, scrip_list: str, operation_name: str
     ) -> bool:
@@ -441,6 +706,7 @@ class ShoonyaWebSocket:
         message_dict = {"t": msg_type, "k": scrip_list}
         return self._send_message(message_dict, operation_name)
 
+    # L2 fix: Snapshot self.ws to prevent race with _close_websocket nulling it
     def _send_message(self, message_dict: dict[str, Any], operation_name: str) -> bool:
         """
         Send message with comprehensive error handling and validation
@@ -452,29 +718,31 @@ class ShoonyaWebSocket:
         Returns:
             bool: True if message sent successfully, False otherwise
         """
-        if not self._validate_connection_state(operation_name):
+        ws = self.ws
+        if not self._validate_connection_state(ws, operation_name):
             return False
 
         try:
             message_json = json.dumps(message_dict)
-            self.ws.send(message_json)
+            ws.send(message_json)
             self.logger.debug(f"Sent {operation_name}: {message_dict}")
             return True
         except Exception as e:
             self.logger.error(f"Failed to send {operation_name}: {e}")
             return False
 
-    def _validate_connection_state(self, operation_name: str) -> bool:
+    def _validate_connection_state(self, ws, operation_name: str) -> bool:
         """
         Validate that connection is ready for sending messages
 
         Args:
+            ws: WebSocket reference snapshot
             operation_name: Operation name for logging
 
         Returns:
             bool: True if connection is ready, False otherwise
         """
-        if not self.ws:
+        if not ws:
             self.logger.warning(f"Cannot send {operation_name}: WebSocket not initialized")
             return False
 
@@ -494,6 +762,7 @@ class ShoonyaWebSocket:
         """
         return self.connected and self.running
 
+    # L5 fix: Snapshot thread references to prevent race with null assignments
     def get_connection_info(self) -> dict[str, Any]:
         """
         Get connection information for debugging
@@ -501,15 +770,17 @@ class ShoonyaWebSocket:
         Returns:
             Dict: Connection state information
         """
+        heartbeat_thread = self._heartbeat_thread
+        ws_thread = self.ws_thread
         return {
             "connected": self.connected,
             "running": self.running,
             "user_id": self.user_id,
             "actid": self.actid,
             "ws_url": self.WS_URL,
-            "last_message_time": self._last_message_time,
-            "heartbeat_thread_alive": self._heartbeat_thread.is_alive()
-            if self._heartbeat_thread
+            "last_message_time": self._get_last_message_time(),
+            "heartbeat_thread_alive": heartbeat_thread.is_alive()
+            if heartbeat_thread
             else False,
-            "ws_thread_alive": self.ws_thread.is_alive() if self.ws_thread else False,
+            "ws_thread_alive": ws_thread.is_alive() if ws_thread else False,
         }

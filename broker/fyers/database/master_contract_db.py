@@ -12,11 +12,12 @@ import httpx
 import numpy as np
 import pandas as pd
 import requests
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from database.auth_db import get_auth_token
+from database.engine_factory import create_db_engine
 from extensions import socketio  # Import SocketIO
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
@@ -76,7 +77,7 @@ data_types = {
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
 
-engine = create_engine(DATABASE_URL)
+engine = create_db_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -207,9 +208,11 @@ def download_csv_fyers_data(output_path: str) -> tuple[bool, list[str], str | No
 
 def reformat_symbol_detail(s):
     parts = s.split()  # Split the string into parts
-    # Reorder and format the parts to match the desired output
-    # Assuming the format is consistent and always "Name DD Mon YY FUT"
-    return f"{parts[0]}{parts[3]}{parts[2].upper()}{parts[1]}{parts[4]}"
+    # Reorder and format the parts to match the OpenAlgo standard symbol format
+    # Input format: "Name DD Mon YY Strike" (e.g., "NIFTY 02 Mar 26 30600")
+    # Output format: Name + DD + MMM + YY + Strike (e.g., "NIFTY02MAR2630600")
+    # This matches the DDMMMYY convention used by all other brokers
+    return f"{parts[0]}{parts[1]}{parts[2].upper()}{parts[3]}{parts[4]}"
 
 
 def process_fyers_nse_csv(path):
@@ -489,7 +492,7 @@ def process_fyers_cds_json(path):
     logger.info("Processing Fyers CDS JSON Data")
     file_path = f"{path}/NSE_CD.json"
 
-    with open(file_path, "r") as f:
+    with open(file_path) as f:
         data = json.load(f)
 
     # Convert dict-of-dicts to DataFrame
@@ -623,7 +626,7 @@ def process_fyers_mcx_json(path):
     logger.info("Processing Fyers MCX JSON Data")
     file_path = f"{path}/MCX_COM.json"
 
-    with open(file_path, "r") as f:
+    with open(file_path) as f:
         data = json.load(f)
 
     # Convert dict-of-dicts to DataFrame

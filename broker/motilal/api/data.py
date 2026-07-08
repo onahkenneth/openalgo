@@ -200,6 +200,14 @@ class BrokerData:
             else:
                 logger.debug("Existing WebSocket not connected, creating new connection")
 
+        # Disconnect old WebSocket before creating a new one
+        if self._websocket:
+            try:
+                self._websocket.disconnect()
+            except Exception as e:
+                logger.debug(f"Error disconnecting old WebSocket: {e}")
+            self._websocket = None
+
         # Get credentials from environment
         client_id = os.getenv("BROKER_API_KEY", "")
         api_key = os.getenv("BROKER_API_SECRET", "")
@@ -656,7 +664,7 @@ class BrokerData:
             # NOTE: Motilal's WebSocket broadcast feed typically only provides depth level 1 (best bid/ask)
             # Levels 2-5 may not be sent via WebSocket depending on subscription type
             logger.debug(f"Waiting for WebSocket depth data for {exchange}:{symbol}")
-            logger.warning("⚠️ Motilal may only provide depth level 1 (best bid/ask) via WebSocket")
+            logger.warning("Motilal may only provide depth level 1 (best bid/ask) via WebSocket")
 
             # Wait for depth data to arrive (increased time for potential multiple levels)
             time.sleep(3.0)
@@ -669,10 +677,10 @@ class BrokerData:
                 bids_count = len([b for b in depth.get("bids", []) if b and b.get("price", 0) > 0])
                 asks_count = len([a for a in depth.get("asks", []) if a and a.get("price", 0) > 0])
                 logger.debug(
-                    f"📊 Received {bids_count} bid levels and {asks_count} ask levels for {symbol}"
+                    f"Received {bids_count} bid levels and {asks_count} ask levels for {symbol}"
                 )
             else:
-                logger.warning(f"❌ No depth data received for {symbol}")
+                logger.warning(f"No depth data received for {symbol}")
 
             # Also try to get quote data (OHLC, LTP, volume) for this symbol
             quote = websocket.get_quote(motilal_exchange, token)

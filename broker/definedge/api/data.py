@@ -11,8 +11,16 @@ import pandas as pd
 from database.token_db import get_br_symbol, get_oa_symbol, get_token
 from utils.logging import get_logger
 
-# Toggle between async and threaded approach
-USE_ASYNC = True  # Set to True to use asyncio (better performance)
+# Auto-detect eventlet environment (Docker/standalone uses gunicorn+eventlet)
+# asyncio.run() cannot be called under eventlet's monkey-patched event loop
+def _is_eventlet_patched():
+    try:
+        import eventlet.patcher
+        return eventlet.patcher.is_monkey_patched("socket")
+    except (ImportError, AttributeError):
+        return False
+
+USE_ASYNC = not _is_eventlet_patched()
 
 logger = get_logger(__name__)
 
@@ -46,7 +54,7 @@ def get_quotes(symbol, exchange, auth_token):
 
         token_id = get_token(symbol, exchange)
 
-        logger.info(f"Getting quotes for {symbol} ({exchange}) with token: {token_id}")
+        logger.debug(f"Getting quotes for {symbol} ({exchange}) with token: {token_id}")
 
         # Handle index symbols - map to their respective exchanges
         api_exchange = exchange
@@ -176,7 +184,7 @@ class BrokerData:
             # Use the updated get_quotes function with correct endpoint
             response = get_quotes(symbol, exchange, self.auth_token)
 
-            logger.info(f"Raw quotes response: {response}")
+            logger.debug(f"Raw quotes response: {response}")
 
             if response.get("status") == "error":
                 raise Exception(response.get("message", "Unknown error"))
@@ -270,8 +278,11 @@ class BrokerData:
             url = f"https://integrate.definedgesecurities.com/dart/v1/quotes/{api_exchange}/{token}"
             headers = {"Authorization": api_session_key}
 
-            # Use httpx.get for sync requests
-            http_response = httpx.get(url, headers=headers, timeout=10.0)
+            # Use shared httpx client for connection pooling
+            from utils.httpx_client import get_httpx_client
+
+            client = get_httpx_client()
+            http_response = client.get(url, headers=headers, timeout=10.0)
 
             if http_response.status_code != 200:
                 return {
@@ -451,7 +462,17 @@ class BrokerData:
             return skipped_symbols
 
         # Step 2: Make concurrent API calls
-        if USE_ASYNC:
+        # Runtime check: even if USE_ASYNC is True, asyncio.run() will crash
+        # if called from within an already-running event loop
+        use_async = USE_ASYNC
+        if use_async:
+            try:
+                asyncio.get_running_loop()
+                use_async = False
+            except RuntimeError:
+                pass
+
+        if use_async:
             # Async approach with httpx.AsyncClient
             results = asyncio.run(
                 self._process_quotes_batch_async(prepared_symbols, api_session_key)
@@ -515,8 +536,13 @@ class BrokerData:
                 # Set start time to 09:15 (market open) for the start date
                 from_date = from_date.replace(hour=9, minute=15)
 
-                # If end_date is today, set the end time to current time
-                current_time = pd.Timestamp.now()
+                # If end_date is today, set the end time to current time.
+                # Anchor "now" to IST wall-clock (not the server's local time) so
+                # the client-side clip below stays correct on UTC/non-IST hosts.
+                # Definedge candle timestamps are naive IST; comparing them against
+                # a server-local now() would truncate the most recent candles by the
+                # host's UTC offset (~5.5h of missing data on a UTC deployment).
+                current_time = pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None)
                 if to_date.date() == current_time.date():
                     to_date = current_time.replace(second=0, microsecond=0)
                 else:
@@ -658,7 +684,11 @@ class BrokerData:
 
                         # Convert datetime string to timestamp
                         # Definedge format is ddMMyyyyHHmm (e.g., 010920250915 = 01-09-2025 09:15)
-                        chunk_df["datetime"] = chunk_df["datetime"].astype(str)
+                        # read_csv parses this all-digit column as int64, which strips the
+                        # leading zero on single-digit days (1-9): "010620260915" -> 10620260915.
+                        # Left-pad back to 12 chars so %d%m%Y%H%M parses; otherwise those
+                        # candles parse to NaT and are silently dropped (e.g. all of Jun 1-9).
+                        chunk_df["datetime"] = chunk_df["datetime"].astype(str).str.zfill(12)
 
                         # For daily data, the format is the same as minute data but with 0000 for time
                         if timeframe == "day":
@@ -710,10 +740,10 @@ class BrokerData:
 
                     # Check if we have valid data
                     if chunk_df.empty:
-                        logger.info(
-                            f"Debug - No valid data after parsing CSV for {timeframe} timeframe"
+                        logger.debug(
+                            f"No valid data after parsing CSV for {timeframe} timeframe"
                         )
-                        logger.info("Debug - This might be due to incorrect date parsing")
+                        logger.debug("This might be due to incorrect date parsing")
                         current_start = current_end + timedelta(days=1)
                         continue
 
@@ -815,6 +845,25 @@ class BrokerData:
             # Ensure timestamp is datetime type (it should already be)
             if "timestamp" in df.columns:
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+            # Clip to the caller-requested window.
+            # Definedge's /sds/history endpoint honors the `from` boundary but
+            # ignores `to` - it returns every candle from `from` up to the latest
+            # available data. Without this clip, an end_date in the past still
+            # returns candles well beyond it. Timestamps here are still naive IST,
+            # matching from_date/to_date, so the comparison is correct.
+            df = df[(df["timestamp"] >= from_date) & (df["timestamp"] <= to_date)].reset_index(
+                drop=True
+            )
+
+            if df.empty:
+                logger.debug(
+                    "Debug - No data within requested range after clipping to "
+                    f"{from_date} - {to_date}"
+                )
+                return pd.DataFrame(
+                    columns=["close", "high", "low", "open", "timestamp", "volume", "oi"]
+                )
 
             # Handle timestamps based on interval type
             if interval == "D":
