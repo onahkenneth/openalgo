@@ -169,7 +169,7 @@ start_container() {
         docker run -d \
             --name ${CONTAINER_NAME} \
             --shm-size=2g \
-            -p 5000:5000 \
+            -p 5001:5000 \
             -p 8765:8765 \
             -v openalgo_db:/app/db \
             -v openalgo_log:/app/log \
@@ -203,7 +203,7 @@ health_check() {
     # Wait for application to start
     print_info "Waiting for application to start (up to 30 seconds)..."
     for i in {1..30}; do
-        if curl -s -f http://127.0.0.1:5000/auth/check-setup >/dev/null 2>&1; then
+        if curl -s -f http://127.0.0.1:5001/auth/check-setup >/dev/null 2>&1; then
             print_success "Application is responding"
             break
         fi
@@ -268,10 +268,10 @@ show_access_info() {
     echo -e "${GREEN}✓ OpenAlgo is now running${NC}\n"
 
     echo -e "${BLUE}Access URLs:${NC}"
-    echo -e "  Web UI:       ${GREEN}http://127.0.0.1:5000${NC}"
+    echo -e "  Web UI:       ${GREEN}http://127.0.0.1:5001${NC}"
     echo -e "  WebSocket:    ${GREEN}ws://127.0.0.1:8765${NC}"
-    echo -e "  API Docs:     ${GREEN}http://127.0.0.1:5000/api/docs${NC}"
-    echo -e "  React UI:     ${GREEN}http://127.0.0.1:5000/react${NC}"
+    echo -e "  API Docs:     ${GREEN}http://127.0.0.1:5001/api/docs${NC}"
+    echo -e "  React UI:     ${GREEN}http://127.0.0.1:5001/react${NC}"
 
     echo -e "\n${BLUE}Useful Commands:${NC}"
     echo -e "  View logs:        ${YELLOW}docker-compose logs -f${NC}"
@@ -283,16 +283,16 @@ show_access_info() {
     echo -e "\n${BLUE}Configured Broker:${NC}"
     if grep -q "fyers" .env 2>/dev/null; then
         echo -e "  ${GREEN}Fyers${NC}"
-        echo -e "  Callback URL: ${YELLOW}http://127.0.0.1:5000/fyers/callback${NC}"
+        echo -e "  Callback URL: ${YELLOW}http://127.0.0.1:5001/fyers/callback${NC}"
     elif grep -q "zerodha" .env 2>/dev/null; then
         echo -e "  ${GREEN}Zerodha${NC}"
-        echo -e "  Callback URL: ${YELLOW}http://127.0.0.1:5000/zerodha/callback${NC}"
+        echo -e "  Callback URL: ${YELLOW}http://127.0.0.1:5001/zerodha/callback${NC}"
     else
         echo -e "  ${YELLOW}Check your .env file for configured broker${NC}"
     fi
 
     echo -e "\n${BLUE}Next Steps:${NC}"
-    echo -e "  1. Open ${GREEN}http://127.0.0.1:5000${NC} in your browser"
+    echo -e "  1. Open ${GREEN}http://127.0.0.1:5001${NC} in your browser"
     echo -e "  2. Complete the initial setup wizard"
     echo -e "  3. Configure your broker credentials"
     echo -e "  4. Start trading with Python strategies!"
