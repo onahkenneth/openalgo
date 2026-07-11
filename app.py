@@ -480,8 +480,7 @@ def create_app():
 
         # Static assets don't need DB
         if (
-            request.path.startswith("/static/")
-            or request.path.startswith("/assets/")
+            request.path.startswith(("/static/", "/assets/"))
         ):
             return
 

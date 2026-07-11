@@ -197,7 +197,7 @@ def add_smtp_columns():
                 conn.execute(
                     text("""
                     CREATE TABLE IF NOT EXISTS settings (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        id SERIAL PRIMARY KEY,
                         analyze_mode BOOLEAN DEFAULT 0
                     )
                 """)

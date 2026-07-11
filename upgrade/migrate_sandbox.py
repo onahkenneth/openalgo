@@ -72,9 +72,7 @@ def create_all_tables(conn):
     logger.info("Creating sandbox tables...")
 
     # 1. SandboxOrders table
-    conn.execute(
-        text(
-            """
+    conn.execute(text("""
         CREATE TABLE IF NOT EXISTS sandbox_orders (
             id BIGSERIAL PRIMARY KEY,
             orderid VARCHAR(50) UNIQUE NOT NULL,
@@ -94,17 +92,13 @@ def create_all_tables(conn):
             pending_quantity INTEGER NOT NULL,
             rejection_reason TEXT,
             margin_blocked DECIMAL(10, 2) DEFAULT 0.00,
-            order_timestamp DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-            update_timestamp DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            order_timestamp TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            update_timestamp TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )
-    """
-        )
-    )
+    """))
 
     # 2. SandboxTrades table
-    conn.execute(
-        text(
-            """
+    conn.execute(text("""
         CREATE TABLE IF NOT EXISTS sandbox_trades (
             id BIGSERIAL PRIMARY KEY,
             tradeid VARCHAR(50) UNIQUE NOT NULL,
@@ -117,16 +111,12 @@ def create_all_tables(conn):
             price DECIMAL(10, 2) NOT NULL,
             product VARCHAR(20) NOT NULL,
             strategy VARCHAR(100),
-            trade_timestamp DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            trade_timestamp TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )
-    """
-        )
-    )
+    """))
 
     # 3. SandboxPositions table
-    conn.execute(
-        text(
-            """
+    conn.execute(text("""
         CREATE TABLE IF NOT EXISTS sandbox_positions (
             id BIGSERIAL PRIMARY KEY,
             user_id VARCHAR(50) NOT NULL,
@@ -140,18 +130,14 @@ def create_all_tables(conn):
             pnl_percent DECIMAL(10, 4) DEFAULT 0.00,
             accumulated_realized_pnl DECIMAL(10, 2) DEFAULT 0.00,
             margin_blocked DECIMAL(15, 2) DEFAULT 0.00,
-            created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-            updated_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            created_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            updated_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             UNIQUE(user_id, symbol, exchange, product)
         )
-    """
-        )
-    )
+    """))
 
     # 4. SandboxHoldings table
-    conn.execute(
-        text(
-            """
+    conn.execute(text("""
         CREATE TABLE IF NOT EXISTS sandbox_holdings (
             id BIGSERIAL PRIMARY KEY,
             user_id VARCHAR(50) NOT NULL,
@@ -163,18 +149,14 @@ def create_all_tables(conn):
             pnl DECIMAL(10, 2) DEFAULT 0.00,
             pnl_percent DECIMAL(10, 4) DEFAULT 0.00,
             settlement_date DATE NOT NULL,
-            created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-            updated_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            created_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            updated_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             UNIQUE(user_id, symbol, exchange)
         )
-    """
-        )
-    )
+    """))
 
     # 5. SandboxFunds table
-    conn.execute(
-        text(
-            """
+    conn.execute(text("""
         CREATE TABLE IF NOT EXISTS sandbox_funds (
             id BIGSERIAL PRIMARY KEY,
             user_id VARCHAR(50) UNIQUE NOT NULL,
@@ -184,29 +166,23 @@ def create_all_tables(conn):
             realized_pnl DECIMAL(15, 2) DEFAULT 0.00,
             unrealized_pnl DECIMAL(15, 2) DEFAULT 0.00,
             total_pnl DECIMAL(15, 2) DEFAULT 0.00,
-            last_reset_date DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            last_reset_date TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             reset_count INTEGER DEFAULT 0,
-            created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-            updated_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            created_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            updated_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )
-    """
-        )
-    )
+    """))
 
     # 6. SandboxConfig table
-    conn.execute(
-        text(
-            """
+    conn.execute(text("""
         CREATE TABLE IF NOT EXISTS sandbox_config (
             id SERIAL PRIMARY KEY,
             config_key VARCHAR(100) UNIQUE NOT NULL,
             config_value TEXT NOT NULL,
             description TEXT,
-            updated_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            updated_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )
-    """
-        )
-    )
+    """))
 
     conn.commit()
     logger.info("✅ All sandbox tables created successfully")
@@ -307,40 +283,28 @@ def add_missing_columns(conn):
     columns = get_table_columns(conn, "sandbox_orders")
 
     if "margin_blocked" not in columns:
-        conn.execute(
-            text(
-                """
+        conn.execute(text("""
             ALTER TABLE sandbox_orders
             ADD COLUMN margin_blocked DECIMAL(10,2) DEFAULT 0.00
-        """
-            )
-        )
+        """))
         logger.info("✅ Added margin_blocked column to sandbox_orders")
 
     # Check and add accumulated_realized_pnl to sandbox_positions if missing
     columns = get_table_columns(conn, "sandbox_positions")
 
     if "accumulated_realized_pnl" not in columns:
-        conn.execute(
-            text(
-                """
+        conn.execute(text("""
             ALTER TABLE sandbox_positions
             ADD COLUMN accumulated_realized_pnl DECIMAL(10,2) DEFAULT 0.00
-        """
-            )
-        )
+        """))
         logger.info("✅ Added accumulated_realized_pnl column to sandbox_positions")
 
     # Check and add margin_blocked to sandbox_positions if missing
     if "margin_blocked" not in columns:
-        conn.execute(
-            text(
-                """
+        conn.execute(text("""
             ALTER TABLE sandbox_positions
             ADD COLUMN margin_blocked DECIMAL(15,2) DEFAULT 0.00
-        """
-            )
-        )
+        """))
         logger.info("✅ Added margin_blocked column to sandbox_positions")
 
     conn.commit()
@@ -444,12 +408,10 @@ def insert_default_config(conn):
         )
         if not result.fetchone():
             conn.execute(
-                text(
-                    """
+                text("""
                 INSERT INTO sandbox_config (config_key, config_value, description)
                 VALUES (:key, :value, :description)
-            """
-                ),
+            """),
                 {"key": key, "value": value, "description": description},
             )
             added_count += 1
@@ -509,14 +471,10 @@ def status():
             # Check all required tables
             missing_tables = []
             for table in required_tables:
-                result = conn.execute(
-                    text(
-                        f"""
+                result = conn.execute(text(f"""
                     SELECT name FROM sqlite_master
                     WHERE type='table' AND name='{table}'
-                """
-                    )
-                )
+                """))
                 if not result.fetchone():
                     missing_tables.append(table)
 
@@ -551,18 +509,14 @@ def status():
                 return False
 
             # Show statistics
-            result = conn.execute(
-                text(
-                    """
+            result = conn.execute(text("""
                 SELECT
                     (SELECT COUNT(*) FROM sandbox_orders) as total_orders,
                     (SELECT COUNT(*) FROM sandbox_trades) as total_trades,
                     (SELECT COUNT(*) FROM sandbox_positions WHERE quantity != 0) as open_positions,
                     (SELECT COUNT(DISTINCT user_id) FROM sandbox_funds) as total_users,
                     (SELECT COUNT(*) FROM sandbox_config) as config_entries
-            """
-                )
-            )
+            """))
 
             stats = result.fetchone()
             logger.info("✅ Sandbox database is fully configured")

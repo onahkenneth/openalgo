@@ -33,7 +33,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect
 
 from utils.logging import get_logger
 
@@ -69,7 +69,7 @@ def create_gtt_tables(conn):
     conn.execute(
         text("""
         CREATE TABLE IF NOT EXISTS sandbox_gtt (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             gtt_id VARCHAR(50) UNIQUE NOT NULL,
             user_id VARCHAR(50) NOT NULL,
             strategy VARCHAR(100),
@@ -80,9 +80,9 @@ def create_gtt_tables(conn):
             gtt_status VARCHAR(20) NOT NULL DEFAULT 'active'
                 CHECK(gtt_status IN ('active', 'triggered', 'cancelled', 'expired', 'rejected')),
             margin_blocked DECIMAL(15, 2) NOT NULL DEFAULT 0.00,
-            expires_at DATETIME,
-            created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-            updated_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            expires_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            updated_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )
     """)
     )
@@ -91,7 +91,7 @@ def create_gtt_tables(conn):
     conn.execute(
         text("""
         CREATE TABLE IF NOT EXISTS sandbox_gtt_legs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             gtt_id VARCHAR(50) NOT NULL,
             leg_number INTEGER NOT NULL,
             trigger_price DECIMAL(10, 2) NOT NULL,
@@ -104,9 +104,9 @@ def create_gtt_tables(conn):
                 CHECK(leg_status IN ('pending', 'triggering', 'triggered', 'cancelled')),
             triggered_order_id VARCHAR(50),
             leg_margin DECIMAL(15, 2) NOT NULL DEFAULT 0.00,
-            claimed_at DATETIME,
-            created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-            updated_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            claimed_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            updated_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             FOREIGN KEY (gtt_id) REFERENCES sandbox_gtt(gtt_id) ON DELETE CASCADE
         )
     """)
@@ -163,10 +163,8 @@ def create_gtt_indexes(conn):
 
 def _sandbox_config_exists(conn):
     """Return True if the sandbox_config table is present."""
-    row = conn.execute(
-        text("SELECT name FROM sqlite_master WHERE type='table' AND name='sandbox_config'")
-    ).fetchone()
-    return row is not None
+    inspector = inspect(conn)
+    return inspector.has_table("sandbox_config")
 
 
 def insert_default_config(conn):

@@ -97,7 +97,7 @@ build_image() {
         # Fallback to direct docker build
         print_info "Using docker build..."
         docker build \
-            --no-cache \
+            # --no-cache \
             --tag ${IMAGE_NAME}:${IMAGE_TAG} \
             --build-arg BUILDKIT_INLINE_CACHE=1 \
             .
@@ -201,14 +201,14 @@ health_check() {
     fi
 
     # Wait for application to start
-    print_info "Waiting for application to start (up to 30 seconds)..."
-    for i in {1..30}; do
+    print_info "Waiting for application to start (up to 45 seconds)..."
+    for i in {1..45}; do
         if curl -s -f http://127.0.0.1:5001/auth/check-setup >/dev/null 2>&1; then
             print_success "Application is responding"
             break
         fi
-        if [ $i -eq 30 ]; then
-            print_warning "Application not responding after 30 seconds"
+        if [ $i -eq 45 ]; then
+            print_warning "Application not responding after 45 seconds"
             print_info "This is normal for first-time startup. Check logs with: docker-compose logs -f"
         fi
         sleep 1

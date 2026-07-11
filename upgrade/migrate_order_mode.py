@@ -112,7 +112,7 @@ def create_pending_orders_table(engine):
             conn.execute(
                 text("""
                 CREATE TABLE pending_orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id BIGSERIAL PRIMARY KEY,
                     user_id VARCHAR(255) NOT NULL,
                     api_type VARCHAR(50) NOT NULL,
                     order_data TEXT NOT NULL,
